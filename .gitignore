@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / UI (later)
+node_modules/
+apps/local-ui/dist/
+apps/local-ui/.next/
+*.tsbuildinfo
+.env
+.env.local
+*.pem
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Secrets / keystores — never commit
+**/*.keystore
+**/wallet.dat
+**/seeds.txt
+.phechan-test-vault/
+**/.phechan/

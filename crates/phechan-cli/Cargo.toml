@@ -1,0 +1,25 @@
+[package]
+name = "phechan-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phechan CLI — inscription-first toolkit"
+default-run = "phechan"
+
+[[bin]]
+name = "phechan"
+path = "src/main.rs"
+
+[dependencies]
+phechan-bitcoin = { workspace = true }
+phechan-validation = { workspace = true }
+phechan-ordinals = { workspace = true }
+phechan-psbt = { workspace = true }
+phechan-keystore = { workspace = true }
+phechan-sat = { workspace = true }
+phechan-runes = { workspace = true }
+phechan-vault = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }

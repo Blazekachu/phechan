@@ -1,0 +1,569 @@
+:root {
+  --bg0: #0e1114;
+  --bg1: #161b20;
+  --bg2: #1e262d;
+  --ink: #e8ecef;
+  --muted: #8b98a5;
+  --line: #2a343d;
+  --accent: #d4a017;
+  --ok: #3dba7a;
+  --bad: #e85d5d;
+  --font-display: "Syne", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, #243040 0%, transparent 55%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, #2a2210 0%, transparent 45%),
+    var(--bg0);
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+.brand {
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 0.25rem;
+}
+
+.tagline {
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+}
+
+.banner {
+  border: 1px solid var(--line);
+  background: var(--bg1);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+  color: var(--muted);
+}
+
+.banner strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.tabs button {
+  font-family: var(--font-mono);
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+}
+
+.tabs button.active {
+  color: var(--bg0);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.panel {
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  padding: 1.25rem;
+}
+
+.panel h2 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  margin: 0 0 1rem;
+}
+
+label {
+  display: block;
+  color: var(--muted);
+  margin: 0.75rem 0 0.35rem;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 0.55rem 0.65rem;
+}
+
+textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+
+.row {
+  display: grid;
+  gap: 0.75rem;
+}
+
+@media (min-width: 700px) {
+  .row.two {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+button.primary {
+  font-family: var(--font-mono);
+  background: var(--accent);
+  color: #1a1408;
+  border: none;
+  padding: 0.55rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.ghost {
+  font-family: var(--font-mono);
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+}
+
+button.danger {
+  font-family: var(--font-mono);
+  background: var(--bad);
+  color: #1a0a0a;
+  border: none;
+  padding: 0.55rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.danger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.out {
+  margin-top: 1rem;
+  background: var(--bg0);
+  border: 1px solid var(--line);
+  padding: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.out.ok {
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--line));
+}
+
+.out.bad {
+  border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  color: var(--muted);
+}
+
+.check input {
+  width: auto;
+}
+
+.health {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2rem;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1rem;
+}
+
+.wallet-card {
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  padding: 0.85rem 1rem;
+  min-width: min(100%, 320px);
+  max-width: 420px;
+}
+
+.wallet-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.network-pill {
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  text-transform: lowercase;
+}
+
+.network-pill.live {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
+    0 0 14px color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: network-glow 2.4s ease-in-out infinite;
+}
+
+.sign-review {
+  margin-top: 1rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg1) 88%, black);
+}
+
+.sign-review.mainnet {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.sign-review h3 {
+  margin: 0 0 0.65rem;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+}
+
+.sign-review h4 {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.sign-review-steps,
+.sign-review-warn,
+.sign-review-io ul {
+  margin: 0 0 0.75rem;
+  padding-left: 1.1rem;
+}
+
+.sign-review-steps li,
+.sign-review-warn li,
+.sign-review-io li {
+  margin: 0.25rem 0;
+  line-height: 1.35;
+}
+
+.sign-review-warn {
+  color: var(--accent);
+}
+
+.sign-review-io {
+  display: grid;
+  gap: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+@media (min-width: 720px) {
+  .sign-review-io {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.sign-review .mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+@keyframes network-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent),
+      0 0 10px color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent),
+      0 0 18px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+}
+
+.wallet-row select {
+  width: auto;
+  min-width: 7rem;
+}
+
+.wallet-meta {
+  color: var(--muted);
+  margin: 0.5rem 0 0;
+  font-size: 12px;
+}
+
+.wallet-addr {
+  margin: 0.35rem 0 0;
+  font-size: 12px;
+  word-break: break-all;
+  color: var(--accent);
+}
+
+.mode-row {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+button.mode {
+  font-family: var(--font-mono);
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+}
+
+button.mode.active {
+  color: var(--bg0);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.fold {
+  margin-top: 1rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+.fold summary {
+  cursor: pointer;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0.4rem 0 0;
+}
+
+.bad-text {
+  color: var(--bad);
+}
+
+.verify-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.verify-row input {
+  flex: 1;
+}
+
+.field-help {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0.15rem 0 0.45rem;
+  line-height: 1.45;
+}
+
+.field-help code {
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.check-label input {
+  width: auto;
+  margin: 0;
+}
+
+.brotli-stats {
+  margin: 0.35rem 0 0.75rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.brotli-stats.on {
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--line));
+  color: var(--fg, #e8e8e8);
+}
+
+.brotli-stats .muted {
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+
+.verify-ok {
+  margin-top: 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, var(--line));
+  background: color-mix(in srgb, var(--ok) 12%, var(--bg1));
+  color: var(--ok);
+  padding: 0.65rem 0.85rem;
+  font-size: 12px;
+}
+
+.verify-bad {
+  margin-top: 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--bad) 45%, var(--line));
+  background: color-mix(in srgb, var(--bad) 12%, var(--bg1));
+  color: var(--bad);
+  padding: 0.65rem 0.85rem;
+  font-size: 12px;
+}
+
+.reinscribe-badge {
+  margin-top: 0.35rem;
+  color: #c4a0ff;
+  font-weight: 600;
+}
+
+.vanity-est {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  background: var(--bg0);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.vanity-est .mono {
+  font-family: var(--font-mono);
+  color: var(--accent);
+}
+
+.vanity-est .muted {
+  color: var(--muted);
+}
+
+.content-preview {
+  margin-top: 1rem;
+  border: 1px solid var(--line);
+  padding: 0.75rem;
+  background: color-mix(in srgb, var(--bg1) 80%, black);
+}
+
+.preview-frame {
+  width: 100%;
+  min-height: 220px;
+  border: 0;
+  background: #fff;
+}
+
+.preview-text {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.flow-status {
+  margin-top: 1rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+}
+
+.flow-status.error {
+  border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
+}
+
+.flow-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.flow-steps .on {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.flow-steps .done {
+  color: var(--ok);
+}
+
+.grind-note {
+  margin: 0.5rem 0 0;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.result-card {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, var(--line));
+  background: color-mix(in srgb, var(--ok) 10%, var(--bg1));
+  font-size: 13px;
+}
+
+.result-card a {
+  color: var(--accent);
+}
+
+.result-card .muted {
+  color: var(--muted);
+  font-size: 12px;
+}

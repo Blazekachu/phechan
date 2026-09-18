@@ -1,0 +1,16 @@
+[package]
+name = "phechan-psbt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PSBT helpers for Phechan commit/reveal inscriptions"
+
+[dependencies]
+phechan-bitcoin = { workspace = true }
+phechan-keystore = { workspace = true }
+bitcoin = { workspace = true }
+secp256k1 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+phechan-ordinals = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "phechan-validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered transaction validation reports for Phechan"
+
+[dependencies]
+phechan-bitcoin = { workspace = true }
+phechan-sat = { workspace = true }
+phechan-runes = { workspace = true }
+bitcoin = { workspace = true }

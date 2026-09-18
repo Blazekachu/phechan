@@ -1,0 +1,9 @@
+[package]
+name = "phechan-sat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sat-flow simulation and parent placement policies — Phase 0 stub"
+
+[dependencies]
+phechan-bitcoin = { workspace = true }

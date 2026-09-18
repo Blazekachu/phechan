@@ -1,0 +1,10 @@
+[package]
+name = "phechan-ordinals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ordinals inscription envelopes for Phechan — Phase 0 stub"
+
+[dependencies]
+phechan-bitcoin = { workspace = true }
+brotli = "7"

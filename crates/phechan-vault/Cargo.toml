@@ -1,0 +1,15 @@
+[package]
+name = "phechan-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parent vault batch state machine (design → regtest demo)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+phechan-sat = { workspace = true }
+phechan-validation = { workspace = true }
+phechan-runes = { workspace = true }
+
+[dev-dependencies]
