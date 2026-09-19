@@ -20,7 +20,13 @@ pub fn dispatch(args: &[String]) -> Result<(), String> {
 }
 
 fn load_psbt(args: &[String]) -> Result<Psbt, String> {
-    let b64 = flag_value(args, "--base64").ok_or("--base64 <psbt> required")?;
+    let b64 = if let Some(path) = flag_value(args, "--base64-file") {
+        std::fs::read_to_string(path.trim())
+            .map_err(|e| format!("--base64-file read failed: {e}"))?
+    } else {
+        flag_value(args, "--base64")
+            .ok_or_else(|| "--base64 <psbt> or --base64-file <path> required".to_string())?
+    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| e.to_string())?;
@@ -119,7 +125,14 @@ fn finalize_import(args: &[String]) -> Result<(), String> {
         );
     }
 
-    let body = flag_value(args, "--expect-body");
+    let body = if let Some(path) = flag_value(args, "--expect-body-file") {
+        Some(
+            std::fs::read_to_string(path.trim())
+                .map_err(|e| format!("--expect-body-file read failed: {e}"))?,
+        )
+    } else {
+        flag_value(args, "--expect-body")
+    };
     let report = if let Some(b) = &body {
         validate_inscription_reveal(&tx, b.as_bytes())
     } else if has_flag(args, "--skip-ordinals-check") {

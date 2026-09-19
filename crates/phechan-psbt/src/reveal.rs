@@ -17,6 +17,8 @@ pub struct RevealPsbtParams {
     pub destination_value: Amount,
     pub leaf_script: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
+    /// Optional OP_RETURN payload (reveal vout1). Max 80 bytes for standard relay.
+    pub op_return: Option<Vec<u8>>,
 }
 
 /// Parent+child reveal: input0=parent, input1=commit; out0=vault (parent return), out1=child dest.
@@ -39,8 +41,27 @@ pub struct ParentChildRevealParams {
     pub spend_info: TaprootSpendInfo,
 }
 
-/// Build unsigned reveal PSBT: spend commit via tapscript to one destination output.
+/// Build unsigned reveal PSBT: spend commit via tapscript to destination [+ optional OP_RETURN].
 pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildError> {
+    let mut outputs = vec![TxOut {
+        value: params.destination_value,
+        script_pubkey: params.destination_script_pubkey,
+    }];
+    if let Some(data) = params.op_return {
+        if data.len() > 80 {
+            return Err(PsbtBuildError::Message(
+                "OP_RETURN payload exceeds 80-byte standard relay limit".into(),
+            ));
+        }
+        let push: &bitcoin::script::PushBytes = data.as_slice().try_into().map_err(|_| {
+            PsbtBuildError::Message("OP_RETURN payload too large for push".into())
+        })?;
+        outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(push),
+        });
+    }
+
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -53,10 +74,7 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: bitcoin::Witness::new(),
         }],
-        output: vec![TxOut {
-            value: params.destination_value,
-            script_pubkey: params.destination_script_pubkey,
-        }],
+        output: outputs,
     };
 
     let mut psbt = Psbt::from_unsigned_tx(tx)

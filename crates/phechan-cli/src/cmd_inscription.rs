@@ -124,6 +124,7 @@ fn estimate_reveal_fee_sats(
     key: &RegtestKey,
     postage_sats: u64,
     fee_rate_sats_vb: f64,
+    op_return: Option<&[u8]>,
 ) -> Result<(u64 /*fee*/, u64 /*vsize*/), String> {
     let provisional_fee = ((fee_rate_sats_vb * 200.0).ceil() as u64).max(200);
     let provisional_commit = postage_sats.saturating_add(provisional_fee);
@@ -137,6 +138,7 @@ fn estimate_reveal_fee_sats(
         destination_value: Amount::from_sat(postage_sats),
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
+        op_return: op_return.map(|d| d.to_vec()),
     })
     .map_err(|e| e.to_string())?;
     let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
@@ -145,6 +147,24 @@ fn estimate_reveal_fee_sats(
     let vsize = tx.vsize() as u64;
     let fee = ((vsize as f64) * fee_rate_sats_vb).round() as u64;
     Ok((fee.max(1), vsize))
+}
+
+/// Parse optional `--op-return` UTF-8 message (≤80 bytes) for reveal nulldata output.
+fn parse_op_return(args: &[String]) -> Result<Option<Vec<u8>>, String> {
+    let Some(s) = flag_value(args, "--op-return") else {
+        return Ok(None);
+    };
+    let bytes = s.into_bytes();
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > 80 {
+        return Err(format!(
+            "OP_RETURN is {} bytes; standard relay limit is 80",
+            bytes.len()
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn resolve_reveal_funding(
@@ -162,11 +182,12 @@ fn resolve_reveal_funding(
         || (flag_value(args, "--fee-sats").is_none() && flag_value(args, "--commit-sats").is_none())
     {
         let fee_rate = fee_rate_opt.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
+        let op_return = parse_op_return(args)?;
         let (mut fee_sats, mut vsize) = if let Some(flat) = flag_value(args, "--fee-sats") {
             let f = flat.parse::<u64>().map_err(|_| "invalid --fee-sats".to_string())?;
             (f, 0u64)
         } else {
-            estimate_reveal_fee_sats(commit, key, postage_sats, fee_rate)?
+            estimate_reveal_fee_sats(commit, key, postage_sats, fee_rate, op_return.as_deref())?
         };
         // Parent-child FI/FO adds parent P2TR input + vault output (~101 vB).
         // Same-sat parent: parent is already inside commit — single-input reveal only.
@@ -254,7 +275,9 @@ pub fn dispatch(args: &[String]) -> Result<(), String> {
 }
 
 fn create(args: &[String]) -> Result<(), String> {
-    let body_owned: Vec<u8> = if let Some(h) = flag_value(args, "--body-hex") {
+    let body_owned: Vec<u8> = if let Some(path) = flag_value(args, "--body-file") {
+        std::fs::read(path.trim()).map_err(|e| format!("--body-file read {path}: {e}"))?
+    } else if let Some(h) = flag_value(args, "--body-hex") {
         hex::decode(h.trim()).map_err(|e| e.to_string())?
     } else {
         flag_value(args, "--body")
@@ -291,13 +314,27 @@ fn reinscribe(args: &[String]) -> Result<(), String> {
         "--satpoint <txid:vout> required (reinscription targets an already-inscribed sat UTXO)",
     )?;
     parse_outpoint(&satpoint)?;
-    let body = flag_value(args, "--body").unwrap_or_else(|| "reinscription".to_string());
+    let body_owned: Vec<u8> = if let Some(path) = flag_value(args, "--body-file") {
+        std::fs::read(path.trim()).map_err(|e| format!("--body-file read {path}: {e}"))?
+    } else if let Some(h) = flag_value(args, "--body-hex") {
+        hex::decode(h.trim()).map_err(|e| e.to_string())?
+    } else {
+        flag_value(args, "--body")
+            .unwrap_or_else(|| "reinscription".to_string())
+            .into_bytes()
+    };
     println!("note: reinscription APPENDS; it does not overwrite prior inscriptions on the sat");
     println!("satpoint: {satpoint}");
     println!(
-        "disclosure: ensure commit funding carries the sat at {satpoint} (transfer into commit first)"
+        "disclosure: fund-commit must spend this UTXO as --carrier-* (vin0) so the sat enters commit"
     );
-    run_single_reveal(args, body.as_bytes(), None, None, "inscription-reinscribe")
+    run_single_reveal(
+        args,
+        &body_owned,
+        None,
+        None,
+        "inscription-reinscribe",
+    )
 }
 
 /// Rough input weight in vbytes (signed) from scriptPubKey type.
@@ -786,9 +823,9 @@ fn run_single_reveal(
     let compress_br = has_flag(args, "--compress-br")
         || flag_value(args, "--content-encoding").as_deref() == Some("br");
 
-    if let Some(opr) = flag_value(args, "--op-return") {
-        println!("op_return_planned: {opr}");
-        println!("note: OP_RETURN attached at finalize/tx-assembly (preview only in dry-run)");
+    if let Some(opr) = parse_op_return(args)? {
+        let preview = String::from_utf8_lossy(&opr);
+        println!("op_return: {preview} ({} bytes → reveal vout1)", opr.len());
     }
     if let Some(vp) = flag_value(args, "--vanity-prefix") {
         println!("vanity_prefix: {vp}");
@@ -882,6 +919,7 @@ fn run_single_reveal(
             destination_value: dest_value,
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
+            op_return: parse_op_return(args)?,
         })
         .map_err(|e| e.to_string())?;
 
@@ -898,7 +936,7 @@ fn run_single_reveal(
         let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
             .map_err(|e| e.to_string())?;
         let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
-        let report = if body.is_empty() {
+        let report = if body_ref.is_empty() {
             phechan_validation::ValidationReport {
                 consensus_ok: Some(true),
                 relay_ok: Some(true),
@@ -907,7 +945,8 @@ fn run_single_reveal(
                 ..Default::default()
             }
         } else {
-            validate_inscription_reveal(&tx, body)
+            // Match bytes actually in the envelope (post --compress-br), not raw input.
+            validate_inscription_reveal(&tx, body_ref)
         };
         println!("network: {}", network.as_str());
         println!("commit_address: {}", commit.address);
@@ -918,7 +957,7 @@ fn run_single_reveal(
         println!("reveal_txid_preview: {}", tx.compute_txid());
         println!("validation.allows_broadcast: {}", report.allows_broadcast());
         for e in &report.errors {
-            println!("error: {e}");
+            println!("validation_error: {e}");
         }
         println!("dry-run complete (not broadcast)");
         return Ok(());
@@ -1060,6 +1099,7 @@ fn run_single_reveal(
         destination_value: dest_value,
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
+        op_return: parse_op_return(args)?,
     })
     .map_err(|e| e.to_string())?;
 
@@ -1117,8 +1157,8 @@ fn run_single_reveal(
     let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
         .map_err(|e| e.to_string())?;
     let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
-    if !body.is_empty() {
-        let report = validate_inscription_reveal(&tx, body);
+    if !body_ref.is_empty() {
+        let report = validate_inscription_reveal(&tx, body_ref);
         if !report.allows_broadcast() {
             return Err(format!(
                 "validation blocked reveal: {}",
@@ -1782,6 +1822,7 @@ fn recover_reveal(args: &[String]) -> Result<(), String> {
         destination_value: Amount::from_sat(postage_sats),
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
+        op_return: parse_op_return(args)?,
     })
     .map_err(|e| e.to_string())?;
 

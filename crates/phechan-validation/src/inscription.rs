@@ -24,15 +24,20 @@ pub fn validate_inscription_reveal(tx: &Transaction, expected_body: &[u8]) -> Va
 
     let mut found_ord = false;
     let mut found_body = expected_body.is_empty();
+    // Ordinal content is pushed in ≤520-byte chunks — full body may not be contiguous.
+    let body_probe: &[u8] = if expected_body.len() > 520 {
+        &expected_body[..520]
+    } else {
+        expected_body
+    };
     for input in &tx.input {
         for item in input.witness.iter() {
             if item.windows(3).any(|w| w == b"ord") {
                 found_ord = true;
             }
-            if !expected_body.is_empty()
-                && item
-                    .windows(expected_body.len())
-                    .any(|w| w == expected_body)
+            if !found_body
+                && !body_probe.is_empty()
+                && item.windows(body_probe.len()).any(|w| w == body_probe)
             {
                 found_body = true;
             }
@@ -54,6 +59,10 @@ pub fn validate_inscription_reveal(tx: &Transaction, expected_body: &[u8]) -> Va
     }
 
     for (i, out) in tx.output.iter().enumerate() {
+        // OP_RETURN / nulldata is allowed at value 0 (inscription message output).
+        if out.script_pubkey.is_op_return() {
+            continue;
+        }
         if out.value.to_sat() == 0 {
             report.errors.push(format!("output {i} has zero value"));
         } else if out.value.to_sat() < P2TR_DUST_SATS {

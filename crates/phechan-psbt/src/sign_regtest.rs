@@ -305,6 +305,7 @@ mod tests {
             destination_value: commit_value.checked_sub(fee).expect("value"),
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
+            op_return: None,
         })
         .unwrap();
 

@@ -15,15 +15,15 @@ fn print_help() {
 phechan — Your Bitcoin. Your Sats. Your Protocol.
 
 Usage:
-  phechan inscription create --body <text> --network regtest|signet (--dry-run|--broadcast|--unsigned-psbt)
+  phechan inscription create --body <text> | --body-file <path> | --body-hex <hex> --network regtest|signet (--dry-run|--broadcast|--unsigned-psbt)
   phechan inscription child --parent <id> --body <text> (--dry-run|--broadcast --parent-outpoint txid:vout)
   phechan inscription delegate --delegate <id> [--body <text>] (--dry-run|--broadcast)
   phechan inscription reinscribe --satpoint txid:vout --body <text> (--dry-run|--broadcast)
   phechan inscription inspect --body <text> | --envelope-hex <hex>
   phechan utxo list [--ord] | utxo inspect --txid <id> --vout <n> [--ord]
   phechan sat select --inputs a,b --outputs c,d --at vin:offset
-  phechan psbt inspect --base64 <psbt>
-  phechan psbt finalize-import --base64 <psbt> --expect-body <text> [--broadcast] [--network regtest|signet]
+  phechan psbt inspect --base64 <psbt> | --base64-file <path>
+  phechan psbt finalize-import (--base64 <psbt> | --base64-file <path>) [--expect-body <text> | --expect-body-file <path>] [--broadcast] [--network regtest|signet]
   phechan vault status|fund|open-batch|reserve|seal|collect-sig|broadcast-ready|settle|abort|close
   phechan tx preview|validate|broadcast --hex <rawtx> [--network regtest]
 
