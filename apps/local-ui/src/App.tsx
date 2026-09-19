@@ -24,7 +24,7 @@ import {
 
 type VerifyUi = "idle" | "loading" | "ok" | "error";
 type FlowPhase = "idle" | "preparing" | "funding" | "review" | "grinding" | "done" | "error";
-type AppPage = "inscribe" | "profile";
+type AppPage = "inscribe" | "profile" | "studio";
 
 type SignReview = {
   kind: "funding" | "reveal";
@@ -126,6 +126,7 @@ export default function App() {
   const [satMsg, setSatMsg] = useState("");
   const [satReinscribe, setSatReinscribe] = useState(false);
   const [satResolvedOutpoint, setSatResolvedOutpoint] = useState("");
+  const [satResolvedValue, setSatResolvedValue] = useState<number | null>(null);
 
   const [showTx, setShowTx] = useState(false);
   const [opReturn, setOpReturn] = useState("");
@@ -171,6 +172,8 @@ export default function App() {
 
   const isMainnetNet =
     network.toLowerCase() === "mainnet" || network.toLowerCase() === "bitcoin";
+  const isRegtestConnected =
+    Boolean(address) && network.toLowerCase() === "regtest";
   const MAINNET_PHRASE = "BROADCAST MAINNET";
 
   /** Attached after user reviews disclosure — no typing. */
@@ -253,6 +256,10 @@ export default function App() {
     }
     refreshInterrupted();
   }, [refreshInterrupted]);
+
+  useEffect(() => {
+    if (page === "studio" && !isRegtestConnected) setPage("inscribe");
+  }, [page, isRegtestConnected]);
 
   useEffect(() => {
     if (!brotliEligible) {
@@ -675,7 +682,7 @@ export default function App() {
 
     try {
       const prep = await api.prepareInscription(plan);
-      if (prep.error) {
+      if (prep.error && !(prep.commit_address && prep.commit_sats)) {
         throw new Error(String(prep.error));
       }
       const commitAddress = String(prep.commit_address || "");
@@ -724,26 +731,53 @@ export default function App() {
       }
 
       const feeR = Number(feeRate) || 1;
-      const [carrierTxid, carrierVoutStr] = parentOutpoint
-        ? parentOutpoint.split(":")
+      // Reinscription / same-sat: inscription UTXO must be vin0 so the sat moves into commit.
+      // Payment alone only creates a NEW sat inscription — sat target would be ignored.
+      const useSatCarrier = Boolean(
+        sameSatParent || (satVerify === "ok" && satResolvedOutpoint)
+      );
+      if (satTarget.trim() && !useSatCarrier) {
+        throw new Error(
+          "Target sat / inscription is set but not Verified. Click Verify so we can spend that UTXO as vin0 (otherwise Xverse only sees your payment UTXO)."
+        );
+      }
+      if (useSatCarrier && !ordinalsPublicKey) {
+        throw new Error(
+          "Missing ordinals public key. Disconnect/reconnect Xverse (Ordinals + Payment) — needed to sign the inscription sat UTXO."
+        );
+      }
+
+      const carrierOutpoint = sameSatParent ? parentOutpoint : satResolvedOutpoint;
+      const [carrierTxid, carrierVoutStr] = carrierOutpoint
+        ? carrierOutpoint.split(":")
         : ["", ""];
       const carrierVout = Number(carrierVoutStr);
-      const carrierValueSats = parentValue ?? 0;
+      const carrierValueSats = sameSatParent
+        ? parentValue ?? 0
+        : satResolvedValue ?? 0;
+      if (useSatCarrier && (!carrierTxid || !Number.isFinite(carrierVout))) {
+        throw new Error("Sat/parent outpoint missing — Verify again.");
+      }
+      if (useSatCarrier && carrierValueSats <= 0) {
+        throw new Error(
+          "Carrier UTXO value unknown. Re-Verify the target sat (needs value from ord/esplora)."
+        );
+      }
 
-      // Same-sat: parent UTXO is vin0. Payment top-up only if it cannot cover commit+fee.
+      // Carrier vin0; payment top-up only if carrier cannot cover commit+fee.
       let needPaymentTopUp = true;
       let utxo:
         | { txid: string; vout: number; value: number; scriptPubKey?: string; address?: string }
         | undefined;
 
-      if (sameSatParent) {
+      if (useSatCarrier) {
         const roughFundVb = 120; // p2tr in + commit + change
         const roughFee = Math.max(1, Math.round(roughFundVb * feeR));
         needPaymentTopUp = carrierValueSats < commitSats + roughFee;
         setOut(
           needPaymentTopUp
-            ? `Same-sat parent: carrier ${parentOutpoint} (${carrierValueSats} sats) + payment top-up → commit ${commitSats}`
-            : `Same-sat parent: funding commit from parent UTXO ${parentOutpoint} (${carrierValueSats} sats) alone`
+            ? `Sat carrier ${carrierOutpoint} (${carrierValueSats} sats) + payment top-up → commit ${commitSats}`
+            : `Funding commit from inscription sat UTXO ${carrierOutpoint} (${carrierValueSats} sats) alone`
         );
         if (needPaymentTopUp) {
           let utxos = fundingUtxos;
@@ -752,7 +786,7 @@ export default function App() {
             if (!u.ok || !u.utxos.length) {
               throw new Error(
                 u.message ||
-                  `Parent UTXO alone is too small (${carrierValueSats} < ${commitSats}+fee). Need a payment UTXO on ${payAddr}.`
+                  `Carrier alone is too small (${carrierValueSats} < ${commitSats}+fee). Need a payment UTXO on ${payAddr}.`
               );
             }
             utxos = u.utxos;
@@ -765,7 +799,7 @@ export default function App() {
           if (!utxo) utxo = pickFundingUtxo(utxos, needPay, feeR, payAddr) || undefined;
           if (!utxo) {
             throw new Error(
-              `Parent ${carrierValueSats} sats + no payment UTXO large enough for top-up (~${needPay} sats)`
+              `Carrier ${carrierValueSats} sats + no payment UTXO large enough for top-up (~${needPay} sats)`
             );
           }
           setSelectedUtxoKey(`${utxo.txid}:${utxo.vout}`);
@@ -806,13 +840,13 @@ export default function App() {
         commitSats,
         paymentAddress: payAddr,
         paymentPublicKey: paymentPublicKey || undefined,
-        changeAddress: sameSatParent ? address : payAddr,
-        ...(sameSatParent
+        changeAddress: payAddr,
+        ...(useSatCarrier
           ? {
               carrierTxid,
               carrierVout,
               carrierValue: carrierValueSats,
-              carrierAddress: parentAddress || address,
+              carrierAddress: (sameSatParent ? parentAddress : undefined) || address,
               ordinalsPublicKey: ordinalsPublicKey || undefined,
               ...(needPaymentTopUp && utxo
                 ? {
@@ -843,7 +877,7 @@ export default function App() {
         throw new Error(String(detail));
       }
 
-      const signInputs: Record<string, number[]> = sameSatParent
+      const signInputs: Record<string, number[]> = useSatCarrier
         ? needPaymentTopUp
           ? { [address]: [0], [payAddr]: [1] }
           : { [address]: [0] }
@@ -867,13 +901,15 @@ export default function App() {
           ? sameSatParent
             ? `Same-sat child on parent ${parentId.trim()} — parent UTXO funds commit; one wallet sign; reveal has no second sign.`
             : `Different-sat child of ${parentId.trim()} — sign #1 funds commit (Payment); after broadcast, sign #2 spends parent (Ordinals).`
-          : "Standalone inscription — one funding sign, then automatic reveal.",
+          : useSatCarrier
+            ? `Reinscription on sat UTXO ${carrierOutpoint} — ordinals vin0 moves the sat into commit${needPaymentTopUp ? "; payment top-up vin1" : ""}.`
+            : "Standalone inscription — one funding sign, then automatic reveal.",
         `Commit output: ${commitSats} sats → ${commitAddress}`,
         `Fee rate ${feeR} sat/vB · postage ${postage} sats`,
-        sameSatParent
+        useSatCarrier
           ? needPaymentTopUp
-            ? "Wallet will sign Ordinals (vin0) + Payment (vin1) in one prompt."
-            : "Wallet will sign Ordinals (parent as vin0) only."
+            ? "Wallet will sign Ordinals (vin0 / inscription sat) + Payment (vin1) in one prompt."
+            : "Wallet will sign Ordinals (inscription sat as vin0) only."
           : "Wallet will sign Payment funding input.",
         "Nothing is broadcast until you approve below and then approve in Xverse.",
       ];
@@ -909,10 +945,10 @@ export default function App() {
       setSignReview(null);
 
       setOut(
-        (sameSatParent
+        (useSatCarrier
           ? needPaymentTopUp
-            ? "Sign once: Ordinals (parent) + Payment (fee) in this wallet prompt…\n"
-            : "Sign once: Ordinals — parent UTXO moves into commit (reveal needs no second sign)…\n"
+            ? "Sign once: Ordinals (inscription sat vin0) + Payment (fee vin1)…\n"
+            : "Sign once: Ordinals — inscription sat moves into commit…\n"
           : parentChildDifferentSat
             ? "Sign #1 of 2: Payment funds commit (Ordinals signs parent at reveal)…\n"
             : "Sign funding in wallet…\n") +
@@ -988,8 +1024,8 @@ export default function App() {
       refreshInterrupted();
 
       setOut(
-        sameSatParent
-          ? `Commit broadcast: ${commitTxid}\nReveal — parent already in commit…`
+        useSatCarrier
+          ? `Commit broadcast: ${commitTxid}\nReveal — target sat already in commit…`
           : `Commit broadcast: ${commitTxid}\nFinishing reveal (same Inscribe flow)…`
       );
       try {
@@ -1035,6 +1071,8 @@ export default function App() {
     parentChildDifferentSat,
     satTarget,
     satResolvedOutpoint,
+    satResolvedValue,
+    satVerify,
     runRevealFromCommit,
     refreshInterrupted,
     isMainnetNet,
@@ -1186,12 +1224,15 @@ export default function App() {
     setSatMsg("");
     setSatReinscribe(false);
     setSatResolvedOutpoint("");
+    setSatResolvedValue(null);
     const r = await api.verifySatTarget(satTarget.trim(), address, network);
     if (r.ok && r.owned) {
       setSatVerify("ok");
       setSatMsg(r.detail || "Verified");
       setSatReinscribe(Boolean(r.reinscribe));
       if (r.txid != null && r.vout != null) setSatResolvedOutpoint(`${r.txid}:${r.vout}`);
+      const val = typeof r.value === "number" ? r.value : Number(r.value);
+      setSatResolvedValue(Number.isFinite(val) ? val : null);
     } else {
       setSatVerify("error");
       setSatMsg(r.error || r.detail || "Not verified");
@@ -1199,7 +1240,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={page === "studio" ? "app app-studio" : "app"}>
       <header className="top">
         <div>
           <h1 className="brand">Phechan</h1>
@@ -1254,7 +1295,31 @@ export default function App() {
         >
           Profile{interrupted.length ? ` (${interrupted.length})` : ""}
         </button>
+        {isRegtestConnected ? (
+          <button
+            type="button"
+            className={page === "studio" ? "mode active" : "mode"}
+            onClick={() => setPage("studio")}
+          >
+            Studio Libraries
+          </button>
+        ) : null}
       </nav>
+
+      {page === "studio" && isRegtestConnected ? (
+        <section className="studio-libraries">
+          <p className="field-help" style={{ marginTop: 0 }}>
+            Regtest OCM Studio — recursion IDs point at local ord (:8081). Paste{" "}
+            <code>studio-paste.js</code>, Run, then Download. Inscribe the downloaded{" "}
+            <code>.html</code> (Brotli optional on top).
+          </p>
+          <iframe
+            className="studio-libraries-frame"
+            title="Studio Libraries (regtest)"
+            src="/studio-regtest/index.html"
+          />
+        </section>
+      ) : null}
 
       {page === "profile" ? (
         <section className="panel">
@@ -1589,6 +1654,7 @@ export default function App() {
                 setSatMsg("");
                 setSatReinscribe(false);
                 setSatResolvedOutpoint("");
+                setSatResolvedValue(null);
               }}
               placeholder="1234567890  or  abc…i0"
               spellCheck={false}
@@ -1632,8 +1698,12 @@ export default function App() {
             Verify. Funding UTXO is only used when Inscribe builds the commit.
           </p>
           <p className="field-help">
-            Loaded from mempool (same pattern as sort-utxo). Auto picks smallest that covers commit +
-            fee if you leave Auto-select.
+            Loaded from local esplora (regtest) / mempool (other nets). Dropdown lists{" "}
+            <strong>all</strong> spendable UTXOs on the <strong>payment</strong> address — no
+            display cap. After a spend, change returns here as one slightly smaller UTXO (e.g.
+            12.5 → ~12.4999) — it replaces the spent coin, it is not a second balance. Regtest
+            only hides immature <em>coinbase</em> rewards (&lt;100 conf), not payment change.
+            Auto picks the smallest that covers commit + fee.
           </p>
           <div className="verify-row">
             <select
@@ -1645,6 +1715,7 @@ export default function App() {
               {fundingUtxos.map((u) => (
                 <option key={`${u.txid}:${u.vout}`} value={`${u.txid}:${u.vout}`}>
                   {u.value.toLocaleString()} sats · {u.txid.slice(0, 8)}…:{u.vout}
+                  {u.confirmations != null ? ` · ${u.confirmations} conf` : ""}
                 </option>
               ))}
             </select>
@@ -1660,13 +1731,20 @@ export default function App() {
                 setFundingUtxos(u.utxos);
                 setSelectedUtxoKey("");
                 setOk(u.ok);
+                const totalSats = u.utxos.reduce((s, x) => s + x.value, 0);
+                const totalBtc = (totalSats / 1e8).toFixed(8);
                 setOut(
                   [
                     u.message,
                     `network: ${network}`,
                     pay && `payment: ${pay}`,
-                    ...u.utxos.slice(0, 8).map(
-                      (x) => `${x.value} sats  ${x.txid.slice(0, 10)}…:${x.vout}`
+                    u.utxos.length
+                      ? `spendable total: ${totalSats.toLocaleString()} sats (${totalBtc} BTC) across ${u.utxos.length} UTXO(s) — all listed in the dropdown`
+                      : null,
+                    ...u.utxos.map(
+                      (x) =>
+                        `${x.value.toLocaleString()} sats  ${x.txid.slice(0, 10)}…:${x.vout}` +
+                        (x.confirmations != null ? `  (${x.confirmations} conf)` : "")
                     ),
                   ]
                     .filter(Boolean)
@@ -1820,8 +1898,13 @@ export default function App() {
           <button
             type="button"
             className="ghost"
-            disabled={busy || !contentPreview}
+            disabled={!contentPreview}
             onClick={() => setShowPreview((v) => !v)}
+            title={
+              contentPreview
+                ? "Toggle content preview (works during grind / sign / wait)"
+                : "Add text or upload a file to preview"
+            }
           >
             {showPreview ? "Hide preview" : "Preview"}
           </button>

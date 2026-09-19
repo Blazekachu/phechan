@@ -567,3 +567,22 @@ button.mode.active {
   color: var(--muted);
   font-size: 12px;
 }
+
+.app-studio {
+  max-width: min(1400px, 100%);
+}
+
+.studio-libraries {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 70vh;
+}
+
+.studio-libraries-frame {
+  width: 100%;
+  height: min(78vh, 900px);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0d1117;
+}

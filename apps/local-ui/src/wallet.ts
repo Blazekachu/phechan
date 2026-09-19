@@ -30,6 +30,8 @@ export type WalletUtxo = {
   value: number;
   scriptPubKey?: string;
   address?: string;
+  /** Set on regtest when esplora tip height is known */
+  confirmations?: number | null;
 };
 
 type Provider = {

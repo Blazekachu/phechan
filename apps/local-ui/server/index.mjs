@@ -4,6 +4,8 @@
  */
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +18,38 @@ const REPO = path.resolve(ROOT, "../..");
 const HOST = "127.0.0.1";
 const API_PORT = Number(process.env.PHECHAN_API_PORT || 8787);
 const UI_PORT = Number(process.env.PHECHAN_UI_PORT || 5173);
+const ORD_URL = (process.env.PHECHAN_ORD_URL || "http://127.0.0.1:8081").replace(/\/+$/, "");
+
+/** In-memory preview HTML for Studio Libraries (regtest) Run → /preview */
+let studioPreviewHtml =
+  "<!DOCTYPE html><html><body><p>No Studio preview yet</p></body></html>";
+
+let studioSimBlock = { height: 534, enabled: true };
+
+function simulateStudioBlock(height) {
+  const h = String(height);
+  const hash = crypto.createHash("sha256").update("block:" + h).digest("hex");
+  const prevHash = crypto
+    .createHash("sha256")
+    .update("block:" + (height - 1))
+    .digest("hex");
+  const merkle = crypto.createHash("sha256").update("merkle:" + h).digest("hex");
+  return {
+    id: hash,
+    height,
+    version: 536870912,
+    timestamp: 1700000000 + height * 600,
+    bits: 386089497,
+    nonce: parseInt(hash.slice(0, 8), 16),
+    difficulty: 95672703408661,
+    merkle_root: merkle,
+    previousblockhash: prevHash,
+    tx_count: 2000,
+    size: 1500000,
+    weight: 3993000,
+    fee_range: [5, 15, 25, 40, 80],
+  };
+}
 
 function json(res, status, body) {
   const data = JSON.stringify(body);
@@ -207,6 +241,14 @@ function esploraBases(network) {
       "https://blockstream.info/api",
     ];
   }
+  if (n === "regtest") {
+    // Local esplora-shim — POST /tx + GET /tx/:id/status (regtest-stack)
+    const local = (process.env.PHECHAN_ESPLORA_URL || "http://127.0.0.1:18443").replace(
+      /\/+$/,
+      ""
+    );
+    return [local];
+  }
   return [];
 }
 
@@ -239,6 +281,70 @@ async function broadcastEsplora(network, txHex) {
   throw new Error(`all Esplora providers failed: ${errors.join(" | ")}`);
 }
 
+/** Write upload bytes to a temp file for --body-file (avoids Windows cmdline limits). */
+function writeUploadTemp(plan) {
+  const buf = Buffer.from(String(plan.contentBase64), "base64");
+  if (!buf.length) throw new Error("empty upload");
+  let contentType = String(plan.contentType || "application/octet-stream");
+  const name = String(plan.fileName || "").toLowerCase();
+  if (
+    (!plan.contentType || contentType === "application/octet-stream") &&
+    /\.(js|mjs|cjs)$/.test(name)
+  ) {
+    contentType = "text/javascript";
+  } else if (
+    (!plan.contentType || contentType === "application/octet-stream") &&
+    /\.html?$/.test(name)
+  ) {
+    contentType = "text/html;charset=utf-8";
+  } else if (
+    (!plan.contentType || contentType === "application/octet-stream") &&
+    /\.txt$/.test(name)
+  ) {
+    contentType = "text/plain;charset=utf-8";
+  }
+  const safe = String(plan.fileName || "upload")
+    .replace(/[^\w.\-]+/g, "_")
+    .slice(0, 64);
+  const tmpPath = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "phechan-upload-")),
+    safe || "body.bin"
+  );
+  fs.writeFileSync(tmpPath, buf);
+  return { tmpPath, contentType, bytes: buf.length };
+}
+
+/** Write text to a temp file (Windows cmdline ~8KB; PSBT/base64 exceeds it). */
+function writeTempUtf8(prefix, text) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const tmpPath = path.join(dir, "data.txt");
+  fs.writeFileSync(tmpPath, String(text), "utf8");
+  return tmpPath;
+}
+
+/** Prefer --base64-file on Windows or when payload is large. */
+function pushPsbtBase64Arg(args, b64) {
+  const s = String(b64 || "");
+  if (process.platform === "win32" || s.length > 2000) {
+    args.push("--base64-file", writeTempUtf8("phechan-psbt-", s));
+  } else {
+    args.push("--base64", s);
+  }
+}
+
+function pushExpectBodyArg(args, expectBody) {
+  const s = String(expectBody || "");
+  if (!s) {
+    args.push("--skip-ordinals-check");
+    return;
+  }
+  if (process.platform === "win32" || s.length > 1500) {
+    args.push("--expect-body-file", writeTempUtf8("phechan-expect-", s));
+  } else {
+    args.push("--expect-body", s);
+  }
+}
+
 /** Map UI inscription plan → phechan CLI args (create | delegate | reinscribe). */
 function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
   const network = String(plan.network || "regtest");
@@ -260,42 +366,29 @@ function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
       String(plan.satTarget).trim(),
       "--network",
       network,
-      "--body",
-      String(plan.body || " "),
     ];
+    if (mode === "upload" && plan.contentBase64) {
+      const { tmpPath, contentType } = writeUploadTemp(plan);
+      args.push("--body-file", tmpPath, "--content-type", contentType);
+    } else {
+      args.push("--body", String(plan.body || " "));
+      if (plan.contentType) args.push("--content-type", String(plan.contentType));
+    }
   } else {
     let bodyText = String(plan.body || "");
     if (mode === "upload" && plan.contentBase64) {
-      // Pass as utf8 lossy preview note — binary via --body-base64 when CLI supports it
-      bodyText = plan.fileName
-        ? `[upload:${plan.fileName}]`
-        : "[upload]";
-      try {
-        const buf = Buffer.from(String(plan.contentBase64), "base64");
-        // Prefer text if utf8-ish small
-        if (buf.length < 200_000) {
-          const asText = buf.toString("utf8");
-          if (!asText.includes("\uFFFD") && (plan.contentType || "").startsWith("text/")) {
-            bodyText = asText;
-          } else {
-            // hex body flag for binary
-            args = null;
-            const base = [
-              "inscription",
-              "create",
-              "--network",
-              network,
-              "--body-hex",
-              buf.toString("hex"),
-              "--content-type",
-              String(plan.contentType || "application/octet-stream"),
-            ];
-            args = base;
-          }
-        }
-      } catch {
-        /* keep placeholder */
-      }
+      // Temp file + --body-file: Windows cmdline ~32KB; --body-hex cannot carry p5 (~287KB).
+      const { tmpPath, contentType } = writeUploadTemp(plan);
+      args = [
+        "inscription",
+        "create",
+        "--network",
+        network,
+        "--body-file",
+        tmpPath,
+        "--content-type",
+        contentType,
+      ];
     }
     if (!args) {
       args = ["inscription", "create", "--body", bodyText || " ", "--network", network];
@@ -431,16 +524,22 @@ function cliResult(res, result) {
     .split(/\r?\n/)
     .map((l) => l.trim())
     .find((l) => /^error:\s*/i.test(l));
+  // Dry-run may print validation diagnostics; don't surface those as API `error`
+  // when the CLI succeeded and returned a commit address.
+  const fields = { ...parsed.fields };
+  if (result.code === 0 && fields.commit_address) {
+    delete fields.error;
+  }
   const error =
     result.code === 0
       ? undefined
-      : (stderrError || stderr || parsed.fields.error || `CLI exited ${result.code}`).replace(
+      : (stderrError || stderr || fields.error || `CLI exited ${result.code}`).replace(
           /^error:\s*/i,
           ""
         );
   json(res, result.code === 0 ? 200 : 400, {
     ok: result.code === 0,
-    ...parsed.fields,
+    ...fields,
     raw: parsed.raw,
     stderr: stderr || undefined,
     ...(error ? { error } : {}),
@@ -463,9 +562,19 @@ async function fetchJson(url, { headers = {}, timeoutMs = 15000, label = "http" 
   return r.json();
 }
 
-/** Local / custom ord HTTP (signet, regtest, or override). */
-async function localOrdGet(path) {
-  const base = (process.env.PHECHAN_ORD_URL || "http://127.0.0.1:8080").replace(/\/+$/, "");
+/** Local / custom ord HTTP (signet :8080, regtest :8081, or PHECHAN_ORD_URL). */
+function ordBaseForNetwork(network) {
+  if (process.env.PHECHAN_ORD_URL) {
+    return String(process.env.PHECHAN_ORD_URL).replace(/\/+$/, "");
+  }
+  const n = String(network || "").toLowerCase();
+  if (n === "regtest") return "http://127.0.0.1:8081";
+  // signet / testnet / unset — historical default
+  return "http://127.0.0.1:8080";
+}
+
+async function localOrdGet(path, network) {
+  const base = ordBaseForNetwork(network);
   return fetchJson(`${base}${path.startsWith("/") ? path : `/${path}`}`, {
     label: "local-ord",
   });
@@ -710,16 +819,16 @@ async function lookupOrd(kind, key, network) {
       try {
         if (kind === "inscription") {
           return normalizeOrdInfo(
-            await localOrdGet(`/inscription/${key}`),
+            await localOrdGet(`/inscription/${key}`, n),
             "PHECHAN_ORD_URL"
           );
         }
         if (kind === "sat") {
-          return normalizeOrdInfo(await localOrdGet(`/sat/${key}`), "PHECHAN_ORD_URL");
+          return normalizeOrdInfo(await localOrdGet(`/sat/${key}`, n), "PHECHAN_ORD_URL");
         }
         if (kind === "utxo") {
           return normalizeOrdInfo(
-            await localOrdGet(`/output/${key}`),
+            await localOrdGet(`/output/${key}`, n),
             "PHECHAN_ORD_URL"
           );
         }
@@ -733,21 +842,101 @@ async function lookupOrd(kind, key, network) {
     );
   }
 
-  // signet / testnet / regtest — local ord
+  // signet / testnet / regtest — local ord (port picked from network)
   if (kind === "inscription") {
-    return normalizeOrdInfo(await localOrdGet(`/inscription/${key}`), "local-ord");
+    return normalizeOrdInfo(await localOrdGet(`/inscription/${key}`, n), "local-ord");
   }
   if (kind === "sat") {
-    return normalizeOrdInfo(await localOrdGet(`/sat/${key}`), "local-ord");
+    return normalizeOrdInfo(await localOrdGet(`/sat/${key}`, n), "local-ord");
   }
   if (kind === "utxo") {
-    return normalizeOrdInfo(await localOrdGet(`/output/${key}`), "local-ord");
+    return normalizeOrdInfo(await localOrdGet(`/output/${key}`, n), "local-ord");
   }
   throw new Error(`unknown ord kind ${kind}`);
 }
 
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function payloadHasDeniedKey(value, depth = 0) {
+  if (depth > 8 || value == null) return false;
+  if (Array.isArray(value)) {
+    return value.some((v) => payloadHasDeniedKey(v, depth + 1));
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      const key = String(k)
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, "");
+      // Key names only — never scan PSBT/base64 values (false "wif" hits).
+      if (
+        key === "wif" ||
+        key === "mnemonic" ||
+        key === "seedphrase" ||
+        key === "seed_phrase" ||
+        key === "privatekey" ||
+        key === "private_key" ||
+        key.includes("privatekey")
+      ) {
+        return true;
+      }
+      if (payloadHasDeniedKey(v, depth + 1)) return true;
+    }
+  }
+  return false;
+}
+
 async function handleApi(req, res) {
   const url = new URL(req.url || "/", `http://${HOST}`);
+
+  // --- Studio Libraries (regtest) preview + block sim ---
+  if (url.pathname === "/preview" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    });
+    res.end(studioPreviewHtml);
+    return;
+  }
+
+  if (url.pathname === "/api/preview" && req.method === "POST") {
+    studioPreviewHtml = await readRawBody(req);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === "/api/block-state" && req.method === "GET") {
+    const info = simulateStudioBlock(studioSimBlock.height);
+    json(res, 200, {
+      height: studioSimBlock.height,
+      enabled: studioSimBlock.enabled,
+      block: info,
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/set-block" && req.method === "POST") {
+    let body;
+    try {
+      body = JSON.parse(await readRawBody(req) || "{}");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return;
+    }
+    if (body.height !== undefined) studioSimBlock.height = parseInt(body.height, 10);
+    if (body.enabled !== undefined) studioSimBlock.enabled = Boolean(body.enabled);
+    const info = simulateStudioBlock(studioSimBlock.height);
+    json(res, 200, { ok: true, block: info });
+    return;
+  }
+
   if (!url.pathname.startsWith("/api/")) {
     json(res, 404, { error: "not found" });
     return;
@@ -762,14 +951,9 @@ async function handleApi(req, res) {
       json(res, 400, { error: "invalid json" });
       return;
     }
-    const blob = JSON.stringify(body).toLowerCase();
-    if (
-      blob.includes("privatekey") ||
-      blob.includes("private_key") ||
-      blob.includes("mnemonic") ||
-      blob.includes("seedphrase") ||
-      blob.includes("wif")
-    ) {
+    // Deny dangerous *field names* only. Do not scan values — signed PSBT
+    // base64 often contains the substring "wif" and was blocking reveal.
+    if (payloadHasDeniedKey(body)) {
       json(res, 400, { error: "private key / seed material is not accepted by local UI API" });
       return;
     }
@@ -1207,13 +1391,12 @@ async function handleApi(req, res) {
         const args = [
           "psbt",
           "finalize-import",
-          "--base64",
-          b64,
           "--network",
           network,
         ];
+        pushPsbtBase64Arg(args, b64);
         if (expectBody) {
-          args.push("--expect-body", expectBody);
+          pushExpectBodyArg(args, expectBody);
         } else {
           args.push("--skip-ordinals-check");
         }
@@ -1258,11 +1441,10 @@ async function handleApi(req, res) {
         const args = [
           "psbt",
           "inspect",
-          "--base64",
-          b64,
           "--network",
           network,
         ];
+        pushPsbtBase64Arg(args, b64);
         const result = await runPhechan(args, { timeoutMs: 60_000, network });
         const parsed = parseCliLines(result.stdout);
         const vin = [];
@@ -1301,12 +1483,11 @@ async function handleApi(req, res) {
         const args = [
           "psbt",
           "finalize-import",
-          "--base64",
-          b64,
           "--network",
           network,
           "--skip-ordinals-check",
         ];
+        pushPsbtBase64Arg(args, b64);
         appendConfirmArg(args, body, network);
         if (body.paymentPublicKey) {
           args.push("--funding-pubkey-hex", String(body.paymentPublicKey));
@@ -1421,7 +1602,7 @@ async function handleApi(req, res) {
       mainnetUnlocked: String(process.env.PHECHAN_ALLOW_MAINNET_BROADCAST || "") === "1",
       mainnetConfirm: MAINNET_PHRASE,
       ordMainnet: "ordinals.com/r → ordiscan (optional PHECHAN_ORDISCAN_API_KEY) → PHECHAN_ORD_URL",
-      ordOther: process.env.PHECHAN_ORD_URL || "http://127.0.0.1:8080",
+      ordOther: process.env.PHECHAN_ORD_URL || "regtest→:8081 signet→:8080",
       ordiscanKeyConfigured: Boolean(ordiscanKey()),
     });
     return;
@@ -1462,7 +1643,13 @@ async function handleApi(req, res) {
               "https://blockstream.info/testnet/api",
             ]
           : network === "regtest"
-            ? []
+            ? [
+                // Local esplora-shim (regtest-stack start-esplora.ps1) — not public esplora
+                (process.env.PHECHAN_ESPLORA_URL || "http://127.0.0.1:18443").replace(
+                  /\/+$/,
+                  ""
+                ),
+              ]
             : [
                 "https://mempool.emzy.de/signet/api",
                 "https://mempool.space/signet/api",
@@ -1494,22 +1681,93 @@ async function handleApi(req, res) {
           lastErr = `${base} → invalid JSON`;
           continue;
         }
-        const utxos = arr
-          .map((u) => ({
-            txid: String(u.txid || ""),
-            vout: Number(u.vout ?? 0),
-            value: Number(u.value ?? 0),
-            address,
-          }))
-          .filter((u) => /^[0-9a-f]{64}$/i.test(u.txid) && u.value > 0)
-          .sort((a, b) => b.value - a.value);
+        let tipHeight = null;
+        if (network === "regtest") {
+          try {
+            const tipRes = await fetch(`${base}/blocks/tip/height`, {
+              signal: AbortSignal.timeout(5000),
+            });
+            if (tipRes.ok) tipHeight = Number((await tipRes.text()).trim());
+          } catch {
+            /* keep all if tip unknown */
+          }
+        }
+        const COINBASE_MATURITY = 100;
+        let skippedImmature = 0;
+        const mapped = arr
+          .map((u) => {
+            const bh = u?.status?.block_height;
+            const conf =
+              tipHeight != null && bh != null && Number.isFinite(Number(bh))
+                ? tipHeight - Number(bh) + 1
+                : null;
+            return {
+              txid: String(u.txid || ""),
+              vout: Number(u.vout ?? 0),
+              value: Number(u.value ?? 0),
+              address,
+              confirmations: conf,
+            };
+          })
+          .filter((u) => /^[0-9a-f]{64}$/i.test(u.txid) && u.value > 0);
+
+        // Only hide immature *coinbase* outputs (100-conf rule). Payment change is
+        // spendable immediately — do not treat "conf < 100" as coinbase.
+        const coinbaseCache = new Map();
+        async function txIsCoinbase(txid) {
+          if (coinbaseCache.has(txid)) return coinbaseCache.get(txid);
+          try {
+            const tr = await fetch(`${base}/tx/${encodeURIComponent(txid)}`, {
+              headers: { Accept: "application/json" },
+              signal: AbortSignal.timeout(8000),
+            });
+            if (!tr.ok) {
+              coinbaseCache.set(txid, false);
+              return false;
+            }
+            const tx = await tr.json();
+            const vin0 = Array.isArray(tx?.vin) ? tx.vin[0] : null;
+            const isCb = Boolean(
+              vin0 && (vin0.is_coinbase === true || typeof vin0.coinbase === "string")
+            );
+            coinbaseCache.set(txid, isCb);
+            return isCb;
+          } catch {
+            coinbaseCache.set(txid, false);
+            return false;
+          }
+        }
+
+        const utxos = [];
+        for (const u of mapped) {
+          if (
+            network === "regtest" &&
+            tipHeight != null &&
+            u.confirmations != null &&
+            u.confirmations < COINBASE_MATURITY
+          ) {
+            const isCb = await txIsCoinbase(u.txid);
+            if (isCb) {
+              skippedImmature += 1;
+              continue;
+            }
+          }
+          utxos.push(u);
+        }
+        utxos.sort((a, b) => b.value - a.value);
         json(res, 200, {
           ok: true,
           utxos,
           provider: base,
           message: utxos.length
-            ? `Found ${utxos.length} UTXO(s) on ${network}`
-            : `No UTXOs on ${address} (${network})`,
+            ? `Found ${utxos.length} UTXO(s) on ${network}${
+                skippedImmature
+                  ? ` (${skippedImmature} immature coinbase hidden — need 100 conf)`
+                  : ""
+              }`
+            : `No UTXOs on ${address} (${network})${
+                skippedImmature ? ` — ${skippedImmature} immature coinbase only` : ""
+              }`,
         });
         return;
       } catch (e) {
@@ -1532,6 +1790,7 @@ async function main() {
 
   await new Promise((resolve) => api.listen(API_PORT, HOST, resolve));
   console.log(`Phechan API  http://${HOST}:${API_PORT}  (localhost only)`);
+  console.log(`Studio Libraries proxies ord @ ${ORD_URL} via Vite /content + /r`);
 
   const vite = await createViteServer({
     root: ROOT,
@@ -1541,11 +1800,33 @@ async function main() {
       strictPort: true,
       proxy: {
         "/api": `http://${HOST}:${API_PORT}`,
+        "/preview": `http://${HOST}:${API_PORT}`,
+        "/content": {
+          target: ORD_URL,
+          changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              proxyReq.setHeader("Accept-Encoding", "br, gzip, deflate, identity");
+              proxyReq.setHeader("Accept", "*/*");
+            });
+          },
+        },
+        "/r": {
+          target: ORD_URL,
+          changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              proxyReq.setHeader("Accept-Encoding", "br, gzip, deflate, identity");
+              proxyReq.setHeader("Accept", "*/*");
+            });
+          },
+        },
       },
     },
   });
   await vite.listen();
   console.log(`Phechan UI   http://${HOST}:${UI_PORT}`);
+  console.log(`Studio Libraries (regtest)  http://${HOST}:${UI_PORT}/studio-regtest/`);
   console.log("No private-key endpoints. Ctrl+C to stop.");
 }
 
