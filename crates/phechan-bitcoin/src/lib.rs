@@ -6,7 +6,10 @@ mod rpc;
 mod taproot_commit;
 mod vanity;
 
-pub use esplora::{broadcast_tx as esplora_broadcast_tx, find_vout_in_esplora_tx, get_tx_json, EsploraError};
+pub use esplora::{
+    broadcast_tx as esplora_broadcast_tx, find_vout_in_esplora_tx, get_tx_json,
+    tip_for_locktime as esplora_tip_for_locktime, EsploraError,
+};
 pub use ord::{OrdClient, OrdConfig, OrdError, OrdOutputInfo};
 pub use rpc::{find_vout_for_address, BitcoindRpc, RpcConfig, RpcError};
 pub use taproot_commit::{build_commit_output, CommitOutput, TaprootCommitError};

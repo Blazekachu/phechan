@@ -5,8 +5,9 @@ use bitcoin::psbt::Psbt;
 use bitcoin::{Address, Amount, ScriptBuf, Txid, XOnlyPublicKey};
 use base64::Engine;
 use phechan_bitcoin::{
-    build_commit_output, find_vout_for_address, grind_locktime_affixes_final, locktime_is_final,
-    with_lock_time, BitcoindRpc, CommitOutput, Network, RpcConfig,
+    build_commit_output, esplora_tip_for_locktime, find_vout_for_address,
+    grind_locktime_affixes_final, locktime_is_final, with_lock_time, BitcoindRpc, CommitOutput,
+    Network, RpcConfig,
 };
 use phechan_keystore::{derive_regtest_key, RegtestKey};
 use phechan_ordinals::{
@@ -105,48 +106,246 @@ fn parse_postage(args: &[String]) -> Result<u64, String> {
     Ok(postage)
 }
 
+/// Chain tip for locktime vanity — wallet network decides the source.
+/// Regtest / explicit PHECHAN_RPC_URL → local bitcoind; otherwise public Esplora
+/// (mainnet/signet/testnet never fall back to the regtest :18444 default).
+fn tip_for_vanity(network: Network) -> Result<(u32, u32), String> {
+    let rpc_configured = std::env::var("PHECHAN_RPC_URL")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let try_local = matches!(network, Network::Regtest) || rpc_configured;
+    if try_local {
+        match BitcoindRpc::new(RpcConfig::from_env()).get_tip_for_locktime() {
+            Ok(tip) => {
+                println!("vanity_tip_via: bitcoind");
+                return Ok(tip);
+            }
+            Err(e) if matches!(network, Network::Regtest) => {
+                return Err(format!(
+                    "vanity needs local regtest tip ({e}); is bitcoind on :18444?"
+                ));
+            }
+            Err(_) => { /* fall through to Esplora on public nets */ }
+        }
+    }
+    match network {
+        Network::Regtest => Err(
+            "vanity on regtest needs local bitcoind (PHECHAN_RPC_* / :18444)".into(),
+        ),
+        other => esplora_tip_for_locktime(other)
+            .map_err(|e| {
+                format!(
+                    "vanity needs {other:?} chain tip via Esplora ({e}); wallet network is {other:?}"
+                )
+            })
+            .map(|(h, t)| {
+                println!("vanity_tip_via: esplora");
+                (h, t)
+            }),
+    }
+}
+
+
+/// Fee in sats for `vsize` at `fee_rate_sats_vb`.
+/// Works for any rate > 0 (e.g. 0.1, 0.69, 1, 42). Uses ceil so we never underfund.
+fn fee_from_vsize(vsize: u64, fee_rate_sats_vb: f64) -> u64 {
+    if !(fee_rate_sats_vb.is_finite() && fee_rate_sats_vb > 0.0) || vsize == 0 {
+        return 1;
+    }
+    let fee = (vsize as f64 * fee_rate_sats_vb).ceil();
+    if !fee.is_finite() || fee < 1.0 {
+        1
+    } else if fee >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        fee as u64
+    }
+}
+
 fn parse_fee_rate(args: &[String]) -> Result<Option<f64>, String> {
     match flag_value(args, "--fee-rate") {
-        Some(s) => {
-            let r: f64 = s.parse().map_err(|_| "invalid --fee-rate".to_string())?;
-            if !(r.is_finite() && r > 0.0) {
-                return Err("--fee-rate must be > 0".into());
-            }
-            Ok(Some(r))
-        }
+        Some(s) => Ok(Some(parse_positive_fee_rate(&s, "--fee-rate")?)),
         None => Ok(None),
     }
 }
 
-/// Estimate reveal vsize by building+signing a throwaway reveal, then fee = ceil(vsize × rate).
+fn parse_positive_fee_rate(s: &str, flag: &str) -> Result<f64, String> {
+    let r: f64 = s
+        .parse()
+        .map_err(|_| format!("invalid {flag}"))?;
+    if !(r.is_finite() && r > 0.0) {
+        return Err(format!("{flag} must be > 0 (fractional sat/vB allowed, e.g. 0.69)"));
+    }
+    Ok(r)
+}
+
+/// Match inscribe.dev (Wizards of Ord) commit-size model — fractional vbytes.
+/// See https://inscribe.dev/js application: BASE_TX_SIZE + TAPROOT_* + payment sizes.
+const INSCRIBE_BASE_TX_VBYTES: f64 = 10.5;
+const INSCRIBE_TAPROOT_INPUT_VBYTES: f64 = 57.5;
+const INSCRIBE_TAPROOT_OUTPUT_VBYTES: f64 = 43.0;
+
+/// Payment / change input weight by address type (native + nested segwit, all networks).
+fn payment_input_vbytes_f(address: &str) -> f64 {
+    let a = address.trim().to_ascii_lowercase();
+    if a.starts_with("bc1p") || a.starts_with("tb1p") || a.starts_with("bcrt1p") {
+        57.5 // P2TR
+    } else if a.starts_with("bc1q") || a.starts_with("tb1q") || a.starts_with("bcrt1q") {
+        67.75 // native P2WPKH
+    } else if a.starts_with('3') || a.starts_with('2') {
+        91.0 // nested P2SH-P2WPKH (Xverse legacy payment)
+    } else if a.starts_with('1') || a.starts_with('m') || a.starts_with('n') {
+        148.0 // legacy P2PKH
+    } else {
+        67.75 // default native segwit
+    }
+}
+
+fn payment_output_vbytes_f(address: &str) -> f64 {
+    let a = address.trim().to_ascii_lowercase();
+    if a.starts_with("bc1p") || a.starts_with("tb1p") || a.starts_with("bcrt1p") {
+        43.0
+    } else if a.starts_with("bc1q") || a.starts_with("tb1q") || a.starts_with("bcrt1q") {
+        31.0
+    } else if a.starts_with('3') || a.starts_with('2') {
+        32.0
+    } else if a.starts_with('1') || a.starts_with('m') || a.starts_with('n') {
+        34.0
+    } else {
+        31.0
+    }
+}
+
+/// Commit funding vsize à la inscribe.dev `selectCommitUTXOs` initial sizing.
+/// `carrier`: reinscribe / rare-sat / same-sat parent vin0 (taproot).
+/// Always includes one payment input + change (conservative; matches typical Xverse flow).
+fn estimate_commit_funding_vbytes_inscribe(carrier: bool, payment_address: Option<&str>) -> u64 {
+    let pay = payment_address.unwrap_or("bc1q");
+    let mut tx_size = INSCRIBE_BASE_TX_VBYTES
+        + INSCRIBE_TAPROOT_OUTPUT_VBYTES // commit output
+        + payment_output_vbytes_f(pay); // change
+    if carrier {
+        tx_size += INSCRIBE_TAPROOT_INPUT_VBYTES;
+    }
+    tx_size += payment_input_vbytes_f(pay);
+    tx_size.ceil() as u64
+}
+
+/// Attach a dummy script-path witness and return measured vsize (wallet-custody path).
+fn vsize_with_dummy_script_path_witness(
+    mut tx: bitcoin::Transaction,
+    input_index: usize,
+    leaf_script: &ScriptBuf,
+    control: &bitcoin::taproot::ControlBlock,
+) -> u64 {
+    use bitcoin::Witness;
+    let mut w = Witness::new();
+    w.push([0u8; 64]); // schnorr (SIGHASH_DEFAULT)
+    w.push(leaf_script.as_bytes());
+    w.push(control.serialize());
+    if let Some(inp) = tx.input.get_mut(input_index) {
+        inp.witness = w;
+    }
+    tx.vsize() as u64
+}
+
+/// Estimate reveal miner fee by measuring a fully-witnessed reveal template.
+/// Parent-child (FI/FO): measure 2-in template (not a flat +110 guess).
 fn estimate_reveal_fee_sats(
     commit: &CommitOutput,
-    key: &RegtestKey,
+    keystore: Option<&RegtestKey>,
     postage_sats: u64,
     fee_rate_sats_vb: f64,
     op_return: Option<&[u8]>,
+    parent_child: bool,
 ) -> Result<(u64 /*fee*/, u64 /*vsize*/), String> {
-    let provisional_fee = ((fee_rate_sats_vb * 200.0).ceil() as u64).max(200);
+    let provisional_fee = fee_from_vsize(200, fee_rate_sats_vb).max(200);
     let provisional_commit = postage_sats.saturating_add(provisional_fee);
     let mock_commit_txid = Txid::from_byte_array([7u8; 32]);
-    let psbt = build_reveal_psbt(RevealPsbtParams {
-        commit_txid: mock_commit_txid,
-        commit_vout: 0,
-        commit_value: Amount::from_sat(provisional_commit),
-        commit_script_pubkey: commit.script_pubkey.clone(),
-        destination_script_pubkey: commit.address.script_pubkey(),
-        destination_value: Amount::from_sat(postage_sats),
-        leaf_script: commit.leaf_script.clone(),
-        spend_info: commit.spend_info.clone(),
-        op_return: op_return.map(|d| d.to_vec()),
-    })
-    .map_err(|e| e.to_string())?;
-    let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
+
+    let vsize = if parent_child {
+        use bitcoin::taproot::LeafVersion;
+        let control = commit
+            .spend_info
+            .control_block(&(commit.leaf_script.clone(), LeafVersion::TapScript))
+            .ok_or_else(|| "missing control block for fee estimate".to_string())?;
+        let mock_parent_txid = Txid::from_byte_array([8u8; 32]);
+        let dest_spk = commit.address.script_pubkey();
+        let psbt = build_parent_child_reveal_psbt(ParentChildRevealParams {
+            parent_txid: mock_parent_txid,
+            parent_vout: 0,
+            parent_value: Amount::from_sat(postage_sats.max(P2TR_DUST_SATS)),
+            parent_script_pubkey: dest_spk.clone(),
+            parent_tap_internal_key: Some(commit.spend_info.internal_key()),
+            commit_txid: mock_commit_txid,
+            commit_vout: 0,
+            commit_value: Amount::from_sat(provisional_commit),
+            commit_script_pubkey: commit.script_pubkey.clone(),
+            vault_script_pubkey: dest_spk.clone(),
+            vault_value: Amount::from_sat(postage_sats.max(P2TR_DUST_SATS)),
+            child_script_pubkey: dest_spk,
+            child_value: Amount::from_sat(postage_sats),
+            leaf_script: commit.leaf_script.clone(),
+            spend_info: commit.spend_info.clone(),
+        })
         .map_err(|e| e.to_string())?;
-    let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
-    let vsize = tx.vsize() as u64;
-    let fee = ((vsize as f64) * fee_rate_sats_vb).round() as u64;
-    Ok((fee.max(1), vsize))
+        let mut tx = psbt.unsigned_tx;
+        // Parent key-path witness
+        {
+            use bitcoin::Witness;
+            let mut w = Witness::new();
+            w.push([0u8; 64]);
+            tx.input[0].witness = w;
+        }
+        // OP_RETURN on reveal (inscribe.dev adds this when enabled) — size matters at low fee rates.
+        if let Some(data) = op_return {
+            if !data.is_empty() && data.len() <= 80 {
+                if let Ok(push) = <&bitcoin::script::PushBytes>::try_from(data) {
+                    tx.output.push(bitcoin::TxOut {
+                        value: Amount::ZERO,
+                        script_pubkey: ScriptBuf::new_op_return(push),
+                    });
+                }
+            }
+        }
+        vsize_with_dummy_script_path_witness(tx, 1, &commit.leaf_script, &control)
+    } else {
+        let psbt = build_reveal_psbt(RevealPsbtParams {
+            commit_txid: mock_commit_txid,
+            commit_vout: 0,
+            commit_value: Amount::from_sat(provisional_commit),
+            commit_script_pubkey: commit.script_pubkey.clone(),
+            destination_script_pubkey: commit.address.script_pubkey(),
+            destination_value: Amount::from_sat(postage_sats),
+            leaf_script: commit.leaf_script.clone(),
+            spend_info: commit.spend_info.clone(),
+            op_return: op_return.map(|d| d.to_vec()),
+        })
+        .map_err(|e| e.to_string())?;
+
+        if let Some(key) = keystore {
+            let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
+                .map_err(|e| e.to_string())?;
+            let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
+            tx.vsize() as u64
+        } else {
+            use bitcoin::taproot::LeafVersion;
+            let control = commit
+                .spend_info
+                .control_block(&(commit.leaf_script.clone(), LeafVersion::TapScript))
+                .ok_or_else(|| "missing control block for fee estimate".to_string())?;
+            vsize_with_dummy_script_path_witness(
+                psbt.unsigned_tx,
+                0,
+                &commit.leaf_script,
+                &control,
+            )
+        }
+    };
+
+    let fee = fee_from_vsize(vsize, fee_rate_sats_vb);
+    Ok((fee, vsize))
 }
 
 /// Parse optional `--op-return` UTF-8 message (≤80 bytes) for reveal nulldata output.
@@ -170,7 +369,7 @@ fn parse_op_return(args: &[String]) -> Result<Option<Vec<u8>>, String> {
 fn resolve_reveal_funding(
     args: &[String],
     commit: &CommitOutput,
-    key: &RegtestKey,
+    keystore: Option<&RegtestKey>,
     _network: Network,
 ) -> Result<RevealFunding, String> {
     let postage_sats = parse_postage(args)?;
@@ -183,26 +382,25 @@ fn resolve_reveal_funding(
     {
         let fee_rate = fee_rate_opt.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
         let op_return = parse_op_return(args)?;
-        let (mut fee_sats, mut vsize) = if let Some(flat) = flag_value(args, "--fee-sats") {
+        let same_sat = has_flag(args, "--same-sat-parent");
+        let parent_child = !same_sat
+            && (flag_value(args, "--parent-outpoint").is_some()
+                || flag_value(args, "--parent").is_some());
+        let (fee_sats, vsize) = if let Some(flat) = flag_value(args, "--fee-sats") {
             let f = flat.parse::<u64>().map_err(|_| "invalid --fee-sats".to_string())?;
             (f, 0u64)
         } else {
-            estimate_reveal_fee_sats(commit, key, postage_sats, fee_rate, op_return.as_deref())?
+            estimate_reveal_fee_sats(
+                commit,
+                keystore,
+                postage_sats,
+                fee_rate,
+                op_return.as_deref(),
+                parent_child,
+            )?
         };
-        // Parent-child FI/FO adds parent P2TR input + vault output (~101 vB).
-        // Same-sat parent: parent is already inside commit — single-input reveal only.
-        let same_sat = has_flag(args, "--same-sat-parent");
-        if !same_sat
-            && (flag_value(args, "--parent-outpoint").is_some()
-                || flag_value(args, "--parent").is_some())
-        {
-            const PARENT_CHILD_EXTRA_VB: u64 = 110;
-            let extra = ((PARENT_CHILD_EXTRA_VB as f64) * fee_rate).round() as u64;
-            fee_sats = fee_sats.saturating_add(extra.max(1));
-            if vsize > 0 {
-                vsize = vsize.saturating_add(PARENT_CHILD_EXTRA_VB);
-            }
-            println!("parent_child_extra_vbytes: {PARENT_CHILD_EXTRA_VB}");
+        if parent_child {
+            println!("parent_child_reveal: true");
         }
         if same_sat {
             println!("same_sat_parent: true");
@@ -218,13 +416,38 @@ fn resolve_reveal_funding(
         if commit_sats < postage_sats.saturating_add(1) {
             return Err("commit funding must exceed postage".into());
         }
+        // Commit tx miner fee — align with inscribe.dev selectCommitUTXOs sizing.
+        // Postage is NOT a network fee. Carrier (reinscribe/sat) adds a taproot input.
+        let commit_fee_rate = match flag_value(args, "--commit-fee-rate") {
+            Some(s) => parse_positive_fee_rate(&s, "--commit-fee-rate")?,
+            None => fee_rate,
+        };
+        let carrier = has_flag(args, "--commit-estimate-carrier")
+            || has_flag(args, "--same-sat-parent")
+            || flag_value(args, "--satpoint-hint").is_some()
+            || flag_value(args, "--reinscribe-id").is_some();
+        // Prefer real payment/change address — never ordinals destination (wrong vin size).
+        let payment_addr = flag_value(args, "--payment-address")
+            .or_else(|| flag_value(args, "--change-address"));
+        let commit_vbytes = estimate_commit_funding_vbytes_inscribe(carrier, payment_addr.as_deref());
+        let commit_fee_estimate_sats = fee_from_vsize(commit_vbytes, commit_fee_rate);
+        let network_fee_sats = fee_sats.saturating_add(commit_fee_estimate_sats);
+
         if vsize > 0 {
             println!("reveal_vsize: {vsize}");
         }
         println!("fee_rate_sats_vb: {fee_rate}");
+        println!("commit_fee_rate_sats_vb: {commit_fee_rate}");
         println!("postage_sats: {postage_sats}");
+        println!("note: postage returns to you with the inscription — not a miner fee");
         println!("reveal_fee_sats: {fee_sats}");
+        println!("commit_estimate_carrier: {carrier}");
+        println!("commit_fee_estimate_sats: {commit_fee_estimate_sats}");
+        println!("commit_fee_estimate_vbytes: {commit_vbytes}");
+        println!("network_fee_sats: {network_fee_sats}");
         println!("commit_sats: {commit_sats}");
+        println!("note: commit_sats = postage + reveal_fee (amount to send to commit address)");
+        println!("note: network_fee_sats = reveal_fee + commit_fee (miner fees; matches inscribe.dev Network Fees)");
         return Ok(RevealFunding {
             postage_sats,
             fee_sats,
@@ -338,17 +561,18 @@ fn reinscribe(args: &[String]) -> Result<(), String> {
 }
 
 /// Rough input weight in vbytes (signed) from scriptPubKey type.
+/// Aligned with inscribe.dev calculateInputSize (ceiled to whole vbytes).
 fn estimate_input_vbytes(spk: &bitcoin::Script) -> u64 {
     if spk.is_p2tr() {
-        58
+        58 // 57.5
     } else if spk.is_p2wpkh() {
-        68
+        68 // 67.75
     } else if spk.is_p2wsh() {
         110
     } else if spk.is_p2sh() {
-        91 // nested P2WPKH typical
+        91 // nested P2WPKH
     } else {
-        148 // legacy P2PKH-ish
+        148 // legacy P2PKH
     }
 }
 
@@ -377,15 +601,16 @@ fn estimate_commit_funding_vbytes_multi(
     commit_spk: &bitcoin::Script,
     change_spk: Option<&bitcoin::Script>,
 ) -> u64 {
-    let mut v = 11u64;
+    // Match inscribe.dev: BASE 10.5 → ceil with inputs/outputs.
+    let mut v = INSCRIBE_BASE_TX_VBYTES;
     for spk in input_spks {
-        v += estimate_input_vbytes(spk);
+        v += estimate_input_vbytes(spk) as f64;
     }
-    v += estimate_output_vbytes(commit_spk);
+    v += estimate_output_vbytes(commit_spk) as f64;
     if let Some(c) = change_spk {
-        v += estimate_output_vbytes(c);
+        v += estimate_output_vbytes(c) as f64;
     }
-    v
+    v.ceil() as u64
 }
 
 /// Build unsigned commit-funding PSBT (wallet signs). Optional commit TXID vanity via locktime.
@@ -429,7 +654,7 @@ fn fund_commit(args: &[String]) -> Result<(), String> {
                 let spks: [&bitcoin::Script; 2] = [spk_c.as_ref(), spk_p.as_ref()];
                 let mut vsize =
                     estimate_commit_funding_vbytes_multi(&spks, &commit_spk, Some(&change_spk));
-                let mut fee_sats = ((vsize as f64) * fee_rate).round() as u64;
+                let mut fee_sats = fee_from_vsize(vsize, fee_rate);
                 fee_sats = fee_sats.max(1);
                 let total_in = c.value.to_sat() + p.value.to_sat();
                 if total_in < commit_sats.saturating_add(fee_sats) {
@@ -457,7 +682,7 @@ fn fund_commit(args: &[String]) -> Result<(), String> {
                 let spks: [&bitcoin::Script; 1] = [spk_c.as_ref()];
                 let mut vsize =
                     estimate_commit_funding_vbytes_multi(&spks, &commit_spk, Some(&change_spk));
-                let mut fee_sats = ((vsize as f64) * fee_rate).round() as u64;
+                let mut fee_sats = fee_from_vsize(vsize, fee_rate);
                 fee_sats = fee_sats.max(1);
                 let funding_value = c.value.to_sat();
                 if funding_value < commit_sats.saturating_add(fee_sats) {
@@ -527,7 +752,7 @@ fn fund_commit(args: &[String]) -> Result<(), String> {
                 let input_type = funding_input_label(&funding_spk);
                 let mut vsize =
                     estimate_commit_funding_vbytes(&funding_spk, &commit_spk, Some(&change_spk));
-                let mut fee_sats = ((vsize as f64) * fee_rate).round() as u64;
+                let mut fee_sats = fee_from_vsize(vsize, fee_rate);
                 fee_sats = fee_sats.max(1);
                 if funding_value < commit_sats.saturating_add(fee_sats) {
                     return Err(format!(
@@ -729,10 +954,7 @@ fn fund_commit_finish(
             .unwrap_or_else(|| "5000000".into())
             .parse()
             .map_err(|_| "invalid --vanity-max-tries")?;
-        let rpc = BitcoindRpc::new(RpcConfig::from_env());
-        let (tip_height, mediantime) = rpc.get_tip_for_locktime().map_err(|e| {
-            format!("commit vanity needs chain tip ({e}); is PHECHAN_RPC_* on {network:?}?")
-        })?;
+        let (tip_height, mediantime) = tip_for_vanity(network)?;
         println!(
             "commit_vanity_grind: prefix={vanity_prefix:?} suffix={vanity_suffix:?} max_tries={max_tries} tip={tip_height} mediantime={mediantime}"
         );
@@ -810,8 +1032,27 @@ fn run_single_reveal(
         return Err("use --unsigned-psbt without --broadcast; then psbt finalize-import --broadcast".into());
     }
 
-    let key = derive_regtest_key(network, key_label).map_err(|e| e.to_string())?;
-    let xonly = key.xonly.serialize();
+    // Self-custody: prefer wallet ordinals x-only pubkey for tapscript CHECKSIG.
+    // Phechan never holds that private key — only the connected wallet can reveal / recover.
+    // Keystore remains for regtest/signet/testnet automation when no pubkey is passed.
+    let (xonly, keystore) = if let Some(pk_hex) = flag_value(args, "--ordinals-pubkey-hex") {
+        let pk = parse_xonly_pubkey(&pk_hex)?;
+        println!("commit_custody: wallet");
+        println!(
+            "note: inscription tapscript uses your wallet pubkey — Phechan cannot spend the commit"
+        );
+        (pk.serialize(), None)
+    } else if network == Network::Mainnet {
+        return Err(
+            "mainnet requires wallet self-custody: pass --ordinals-pubkey-hex (connect Ordinals wallet in UI)"
+                .into(),
+        );
+    } else {
+        let key = derive_regtest_key(network, key_label).map_err(|e| e.to_string())?;
+        println!("commit_custody: keystore");
+        let x = key.xonly.serialize();
+        (x, Some(key))
+    };
 
     let content_type = flag_value(args, "--content-type")
         .unwrap_or_else(|| "text/plain;charset=utf-8".into());
@@ -901,10 +1142,19 @@ fn run_single_reveal(
     };
     let commit = build_commit_output(network, &xonly, leaf).map_err(|e| e.to_string())?;
 
-    let funding = resolve_reveal_funding(args, &commit, &key, network)?;
+    let funding = resolve_reveal_funding(args, &commit, keystore.as_ref(), network)?;
     let commit_value_sats = funding.commit_sats;
     let postage_sats = funding.postage_sats;
     let fee_sats = funding.fee_sats;
+
+    // Wallet custody cannot keystore-sign. Treat --broadcast as unsigned PSBT for the wallet.
+    let mut unsigned_psbt = unsigned_psbt;
+    let mut broadcast = broadcast;
+    if keystore.is_none() && broadcast && !unsigned_psbt {
+        println!("note: wallet custody — returning unsigned reveal PSBT (wallet must sign)");
+        unsigned_psbt = true;
+        broadcast = false;
+    }
 
     if dry_run && !broadcast {
         let commit_value = Amount::from_sat(commit_value_sats);
@@ -933,32 +1183,47 @@ fn run_single_reveal(
             return Ok(());
         }
 
-        let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
-            .map_err(|e| e.to_string())?;
-        let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
-        let report = if body_ref.is_empty() {
-            phechan_validation::ValidationReport {
-                consensus_ok: Some(true),
-                relay_ok: Some(true),
-                ordinals_ok: Some(true),
-                runes_ok: Some(true),
-                ..Default::default()
+        if let Some(ref key) = keystore {
+            let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
+                .map_err(|e| e.to_string())?;
+            let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
+            let report = if body_ref.is_empty() {
+                phechan_validation::ValidationReport {
+                    consensus_ok: Some(true),
+                    relay_ok: Some(true),
+                    ordinals_ok: Some(true),
+                    runes_ok: Some(true),
+                    ..Default::default()
+                }
+            } else {
+                // Match bytes actually in the envelope (post --compress-br), not raw input.
+                validate_inscription_reveal(&tx, body_ref)
+            };
+            println!("network: {}", network.as_str());
+            println!("commit_address: {}", commit.address);
+            println!("leaf_script_len: {}", commit.leaf_script.len());
+            if let Some(d) = delegate_id {
+                println!("delegate_id: {d}");
             }
-        } else {
-            // Match bytes actually in the envelope (post --compress-br), not raw input.
-            validate_inscription_reveal(&tx, body_ref)
-        };
+            println!("reveal_txid_preview: {}", tx.compute_txid());
+            println!("validation.allows_broadcast: {}", report.allows_broadcast());
+            for e in &report.errors {
+                println!("validation_error: {e}");
+            }
+            // postage/reveal_fee/commit_sats already printed by resolve_reveal_funding
+            println!("dry-run complete (not broadcast)");
+            return Ok(());
+        }
+
         println!("network: {}", network.as_str());
         println!("commit_address: {}", commit.address);
         println!("leaf_script_len: {}", commit.leaf_script.len());
         if let Some(d) = delegate_id {
             println!("delegate_id: {d}");
         }
-        println!("reveal_txid_preview: {}", tx.compute_txid());
-        println!("validation.allows_broadcast: {}", report.allows_broadcast());
-        for e in &report.errors {
-            println!("validation_error: {e}");
-        }
+        // postage/reveal_fee/commit_sats already printed by resolve_reveal_funding
+        println!("validation.allows_broadcast: true");
+        println!("note: wallet must sign reveal (script-path) — Phechan has no commit private key");
         println!("dry-run complete (not broadcast)");
         return Ok(());
     }
@@ -1073,7 +1338,7 @@ fn run_single_reveal(
             return reveal_parent_child_wallet(
                 args,
                 network,
-                &key,
+                keystore.as_ref(),
                 &commit,
                 parent_id_s,
                 &parent_out,
@@ -1112,10 +1377,7 @@ fn run_single_reveal(
             .unwrap_or_else(|| "5000000".into())
             .parse()
             .map_err(|_| "invalid --vanity-max-tries")?;
-        let rpc_tip = BitcoindRpc::new(RpcConfig::from_env());
-        let (tip_height, mediantime) = rpc_tip.get_tip_for_locktime().map_err(|e| {
-            format!("reveal vanity needs chain tip ({e}); is PHECHAN_RPC_* on {network:?}?")
-        })?;
+        let (tip_height, mediantime) = tip_for_vanity(network)?;
         println!(
             "vanity_grind: prefix={vanity_prefix:?} suffix={vanity_suffix:?} max_tries={max_tries} tip={tip_height} mediantime={mediantime}"
         );
@@ -1149,11 +1411,19 @@ fn run_single_reveal(
         println!("commit_vout: {vout}");
         println!("commit_address: {}", commit.address);
         println!("psbt_base64: {b64}");
-        println!("note: reveal script-path spends the Phechan commit key (keystore), not Xverse");
-        println!("note: prefer wallet sendTransfer → commit, then --broadcast with --commit-txid");
+        if keystore.is_none() {
+            println!("note: wallet self-custody — sign this reveal PSBT in your wallet (script-path)");
+            println!("note: only your wallet key can spend / recover this commit");
+        } else {
+            println!("note: reveal script-path spends the Phechan commit key (keystore), not Xverse");
+            println!("note: prefer wallet sendTransfer → commit, then --broadcast with --commit-txid");
+        }
         return Ok(());
     }
 
+    let key = keystore.ok_or_else(|| {
+        "internal: wallet custody should have returned unsigned PSBT before keystore sign".to_string()
+    })?;
     let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script)
         .map_err(|e| e.to_string())?;
     let tx = finalize_to_tx(&signed).map_err(|e| e.to_string())?;
@@ -1211,20 +1481,19 @@ fn run_single_reveal(
     Ok(())
 }
 
-/// FI/FO parent+child reveal for wallet UI (signet/testnet/regtest).
+/// FI/FO parent+child reveal for wallet UI (signet/testnet/regtest/mainnet).
 ///
 /// Layout (always):
 /// - vin0 = parent inscription UTXO (wallet signs)
-/// - vin1 = commit (keystore script-path signed here)
+/// - vin1 = commit (keystore script-path if automation key; else wallet signs too)
 /// - vout0 = vault — parent sat returns here (same value as parent input)
 /// - vout1 = child destination — new inscription postage
 ///
-/// Returns a PSBT with commit already finalized; wallet must sign input 0, then
-/// `psbt finalize-import` / UI broadcast. Never broadcasts without parent spend.
+/// Returns a PSBT; wallet must sign remaining inputs, then finalize / broadcast.
 fn reveal_parent_child_wallet(
     args: &[String],
     network: Network,
-    key: &RegtestKey,
+    keystore: Option<&RegtestKey>,
     commit: &CommitOutput,
     parent_id: &str,
     parent_out: &str,
@@ -1377,10 +1646,7 @@ fn reveal_parent_child_wallet(
             .unwrap_or_else(|| "5000000".into())
             .parse()
             .map_err(|_| "invalid --vanity-max-tries")?;
-        let rpc_tip = BitcoindRpc::new(RpcConfig::from_env());
-        let (tip_height, mediantime) = rpc_tip.get_tip_for_locktime().map_err(|e| {
-            format!("reveal vanity needs chain tip ({e}); is PHECHAN_RPC_* on {network:?}?")
-        })?;
+        let (tip_height, mediantime) = tip_for_vanity(network)?;
         let (lt, ground_txid) = grind_locktime_affixes_final(
             &template,
             &vanity_prefix,
@@ -1399,9 +1665,14 @@ fn reveal_parent_child_wallet(
         println!("vanity_reveal_txid: {ground_txid}");
     }
 
-    // Sign commit (input 1) only — parent (input 0) is for the wallet.
-    let partially = sign_reveal_script_path_at(psbt, 1, &key.keypair, &commit.leaf_script)
-        .map_err(|e| e.to_string())?;
+    // Sign commit (input 1) only when we have a local keystore key.
+    // Wallet custody: leave both inputs for the wallet (parent key-path + commit script-path).
+    let out_psbt = if let Some(key) = keystore {
+        sign_reveal_script_path_at(psbt, 1, &key.keypair, &commit.leaf_script)
+            .map_err(|e| e.to_string())?
+    } else {
+        psbt
+    };
 
     println!("network: {}", network.as_str());
     println!("parent_id: {parent_id}");
@@ -1418,14 +1689,24 @@ fn reveal_parent_child_wallet(
     println!("reveal_fee_sats: {fee_sats}");
     println!("commit_txid: {commit_txid_s}");
     println!("placement: FirstInFirstOut");
-    println!("sign_inputs_hint: wallet must sign input 0 (ordinals / parent address)");
+    if keystore.is_some() {
+        println!("sign_inputs_hint: wallet must sign input 0 (ordinals / parent address)");
+    } else {
+        println!(
+            "sign_inputs_hint: wallet must sign input 0 (parent) and input 1 (commit script-path)"
+        );
+    }
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(partially.serialize());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(out_psbt.serialize());
     println!("psbt_base64: {b64}");
-    println!("note: commit input is keystore-signed; sign parent in wallet, then finalize+broadcast");
+    if keystore.is_some() {
+        println!("note: commit input is keystore-signed; sign parent in wallet, then finalize+broadcast");
+    } else {
+        println!("note: wallet self-custody — sign parent + commit in wallet; Phechan holds no reveal key");
+    }
 
     if unsigned_psbt || !broadcast {
-        println!("parent_child_psbt: awaiting wallet signature on input 0");
+        println!("parent_child_psbt: awaiting wallet signature");
         return Ok(());
     }
 
@@ -1834,10 +2115,7 @@ fn recover_reveal(args: &[String]) -> Result<(), String> {
             .unwrap_or_else(|| "5000000".into())
             .parse()
             .map_err(|_| "invalid --vanity-max-tries")?;
-        let rpc_tip = BitcoindRpc::new(RpcConfig::from_env());
-        let (tip_height, mediantime) = rpc_tip.get_tip_for_locktime().map_err(|e| {
-            format!("vanity needs chain tip ({e})")
-        })?;
+        let (tip_height, mediantime) = tip_for_vanity(network)?;
         let (lt, ground_txid) = grind_locktime_affixes_final(
             &unsigned,
             &vanity_prefix,

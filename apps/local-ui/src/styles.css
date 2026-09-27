@@ -140,6 +140,65 @@ textarea {
   margin-top: 1rem;
 }
 
+.network-cost {
+  margin-top: 0.65rem;
+}
+
+.network-cost-line {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  margin: 0;
+  color: var(--text, #e8e4d9);
+}
+
+.network-cost-line.muted,
+.network-cost-line .muted {
+  color: var(--muted, #9a9588);
+  font-weight: 400;
+}
+
+.network-cost-line.bad {
+  color: var(--bad, #e07070);
+}
+
+.network-cost-line strong {
+  color: var(--accent, #e8a84a);
+  font-weight: 600;
+}
+
+.custody-panel {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  max-width: 36rem;
+}
+
+.custody-panel p {
+  margin: 0 0 0.65rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.custody-heading {
+  margin: 1rem 0 0.45rem;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.01em;
+}
+
+.custody-heading:first-child {
+  margin-top: 0;
+}
+
+.custody-panel a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 button.primary {
   font-family: var(--font-mono);
   background: var(--accent);
@@ -358,6 +417,42 @@ button.danger:disabled {
   margin-bottom: 0.75rem;
 }
 
+.pace-toggle {
+  display: inline-flex;
+  gap: 0;
+  margin: 0.35rem 0 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+button.pace {
+  font-family: var(--font-mono);
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-right: 1px solid var(--line);
+  padding: 0.45rem 1rem;
+  cursor: pointer;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+button.pace:last-child {
+  border-right: none;
+}
+
+button.pace:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.pace.active {
+  color: var(--bg0);
+  background: var(--accent);
+  font-weight: 700;
+}
+
 button.mode {
   font-family: var(--font-mono);
   background: transparent;
@@ -526,6 +621,14 @@ button.mode.active {
 
 .flow-status.error {
   border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
+}
+
+.flow-status.committed {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+.flow-status.committed {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
 }
 
 .flow-steps {

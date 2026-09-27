@@ -45,8 +45,18 @@ export type InscribePlan = {
   /** Commit funding TXID vanity (grind funding PSBT locktime) */
   commitVanityPrefix?: string;
   commitVanitySuffix?: string;
-  /** Reveal fee rate in sats per virtual byte (also used for commit funding PSBT) */
+  /**
+   * Legacy single rate — prefer commitFeeRate + revealFeeRate.
+   * Kept so older interrupted commits / bundles still load.
+   */
   feeRate?: number;
+  /** Fee rate for the commit funding PSBT only (sats/vB). */
+  commitFeeRate?: number;
+  /**
+   * Fee rate used to size commit_sats = postage + reveal fee (sats/vB).
+   * After funding, actual reveal fee is commit_value − postage.
+   */
+  revealFeeRate?: number;
   /** Inscription output value (postage / padding), sats */
   postage?: number;
   /** Ordinals / receive address for reveal output */
@@ -74,6 +84,8 @@ export type PrepareResult = CliResponse & {
   commit_sats?: string;
   postage_sats?: string;
   reveal_fee_sats?: string;
+  commit_fee_estimate_sats?: string;
+  network_fee_sats?: string;
   fee_rate_sats_vb?: string;
   reveal_vsize?: string;
 };
@@ -131,7 +143,12 @@ export const api = {
     body?: string;
     contentBase64?: string;
     feeRate?: number;
-  }) => post("/api/inscription/brotli-preview", opts),
+    revealFeeRate?: number;
+  }) =>
+    post("/api/inscription/brotli-preview", {
+      ...opts,
+      feeRate: opts.revealFeeRate ?? opts.feeRate,
+    }),
   fundCommitPsbt: (plan: InscribePlan & Record<string, unknown>) =>
     post("/api/inscription/fund-psbt", plan) as Promise<FundPsbtResult>,
   revealInscription: (plan: InscribePlan) =>
@@ -149,6 +166,20 @@ export const api = {
     paymentPublicKey?: string;
     confirm?: string;
   }) => post("/api/psbt/finalize-funding", opts),
+  /** Atomic commit+reveal via bitcoind submitpackage (Esplora sequential fallback). */
+  submitPackage: (opts: {
+    network: string;
+    commitHex: string;
+    revealHex: string;
+    confirm?: string;
+  }) =>
+    post("/api/tx/submit-package", opts as unknown as Record<string, unknown>) as Promise<
+      CliResponse & {
+        package_via?: string;
+        package_note?: string;
+        txids?: string[];
+      }
+    >,
   previewInscription: (plan: InscribePlan) =>
     post("/api/inscription/preview", plan as unknown as Record<string, unknown>),
   exportPsbt: (plan: InscribePlan) =>

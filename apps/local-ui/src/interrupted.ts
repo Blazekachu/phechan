@@ -1,4 +1,7 @@
-/** Interrupted commit+reveal jobs — safety net if the tab dies after commit broadcast. */
+/**
+ * Interrupted / deferred commit+reveal jobs.
+ * Also backing store for Profile + uploaded `*.phechan.json` commit bundles.
+ */
 
 import type { InscribePlan } from "./api";
 

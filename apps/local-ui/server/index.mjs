@@ -95,7 +95,9 @@ function readBitcoinConfRpc(confPath) {
   return null;
 }
 
-/** Point CLI at the matching local bitcoind (signet 38332 vs regtest 18444). */
+/** Point CLI at the matching local bitcoind when one exists.
+ * Mainnet/testnet: do NOT default to regtest :18444 — vanity/tip use Esplora.
+ */
 function rpcEnvForNetwork(network) {
   if (process.env.PHECHAN_RPC_URL) return {};
   const n = String(network || "").toLowerCase();
@@ -116,8 +118,9 @@ function rpcEnvForNetwork(network) {
     };
   }
   if (n === "regtest" || !n) {
-    return {}; // keep crate defaults (18444 / phechan_plain)
+    return {}; // crate defaults (:18444 / phechan_plain)
   }
+  // mainnet / testnet — no local RPC; CLI vanity tip uses Esplora for wallet network
   return {};
 }
 
@@ -179,9 +182,15 @@ function parseCliLines(stdout) {
     if (idx > 0) {
       const key = line.slice(0, idx).trim();
       const val = line.slice(idx + 1).trim();
-      if (!lines[key]) lines[key] = val;
-      else if (Array.isArray(lines[key])) lines[key].push(val);
-      else lines[key] = [lines[key], val];
+      if (lines[key] === undefined) {
+        lines[key] = val;
+      } else if (Array.isArray(lines[key])) {
+        // Multi-value keys (note, validation_error) — skip exact dupes
+        if (!lines[key].includes(val)) lines[key].push(val);
+      } else if (lines[key] !== val) {
+        lines[key] = [lines[key], val];
+      }
+      // Identical duplicate (e.g. commit_sats printed twice) — keep scalar
     }
   }
   return { fields: lines, raw };
@@ -192,26 +201,117 @@ function isMainnet(network) {
   return n === "mainnet" || n === "bitcoin";
 }
 
-const MAINNET_PHRASE = "BROADCAST MAINNET";
+/** Legacy no-op — network is taken from the connected wallet; no env/confirm gate. */
+function assertMainnetGate(_body, _network) {}
 
-/** Mainnet: env unlock required. Confirm phrase is attached by UI after disclosure (no typing). */
-function assertMainnetGate(body, network) {
+/**
+ * Mainnet self-custody: inscription tapscript must use the connected wallet pubkey.
+ * Phechan never holds that private key — no steal surface via keystore / server keys.
+ */
+function requireWalletCustodyPubkey(plan, network) {
   if (!isMainnet(network)) return;
-  if (String(process.env.PHECHAN_ALLOW_MAINNET_BROADCAST || "") !== "1") {
+  const pk = String(plan?.ordinalsPublicKey || "").trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(pk) && !/^[0-9a-fA-F]{66}$/.test(pk)) {
     throw new Error(
-      "mainnet locked; restart API with PHECHAN_ALLOW_MAINNET_BROADCAST=1"
+      "mainnet self-custody requires ordinalsPublicKey from the connected wallet (no server/keystore spend key)"
     );
-  }
-  if (String(body.confirm || "").trim() !== MAINNET_PHRASE) {
-    throw new Error("mainnet broadcast requires UI confirm after disclosure");
   }
 }
 
 function appendConfirmArg(args, body, network) {
-  if (isMainnet(network) && body.confirm) {
+  if (body.confirm) {
     args.push("--confirm", String(body.confirm).trim());
   }
   return args;
+}
+
+function resolveRpcCreds(network) {
+  const overlay = rpcEnvForNetwork(network);
+  const url =
+    overlay.PHECHAN_RPC_URL ||
+    process.env.PHECHAN_RPC_URL ||
+    (String(network || "").toLowerCase() === "regtest" || !network
+      ? "http://127.0.0.1:18444"
+      : "");
+  const user =
+    overlay.PHECHAN_RPC_USER || process.env.PHECHAN_RPC_USER || "ord";
+  const pass =
+    overlay.PHECHAN_RPC_PASS ||
+    process.env.PHECHAN_RPC_PASS ||
+    "regtest-local-dev";
+  if (!url) return null;
+  // submitpackage is node-wide; strip /wallet/... path if present
+  const base = String(url).replace(/\/wallet\/[^/]+\/?$/, "");
+  return { url: base, user, pass };
+}
+
+async function bitcoindRpcCall(network, method, params) {
+  const creds = resolveRpcCreds(network);
+  if (!creds) throw new Error("no bitcoind RPC configured for this network");
+  const auth = Buffer.from(`${creds.user}:${creds.pass}`).toString("base64");
+  const r = await fetch(creds.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${auth}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: "1.0",
+      id: "phechan",
+      method,
+      params,
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const j = await r.json();
+  if (j.error) {
+    throw new Error(j.error.message || JSON.stringify(j.error));
+  }
+  return j.result;
+}
+
+/**
+ * Atomic commit+reveal: prefer bitcoind submitpackage so parent/rare sats never
+ * land in a stuck commit-only state. Fall back to sequential Esplora broadcast.
+ */
+async function broadcastPackage(network, hexes) {
+  const txs = (hexes || []).map((h) => String(h || "").trim()).filter(Boolean);
+  if (txs.length < 1) throw new Error("package requires at least one tx hex");
+  for (const hex of txs) {
+    if (!/^[0-9a-fA-F]+$/.test(hex)) throw new Error("invalid tx hex in package");
+  }
+  try {
+    const result = await bitcoindRpcCall(network, "submitpackage", [txs]);
+    const txids = [];
+    if (result && typeof result === "object") {
+      const map = result.tx_results || result.package_results || {};
+      for (const [k, v] of Object.entries(map)) {
+        if (v && v.txid) txids.push(String(v.txid));
+        else if (/^[0-9a-fA-F]{64}$/.test(k)) txids.push(k);
+      }
+    }
+    return {
+      ok: true,
+      package_via: "bitcoind-submitpackage",
+      txids: txids.length ? txids : undefined,
+      raw: result,
+    };
+  } catch (pkgErr) {
+    const txids = [];
+    const providers = [];
+    for (const hex of txs) {
+      const { txid, provider } = await broadcastEsplora(network, hex);
+      txids.push(txid);
+      providers.push(provider);
+    }
+    return {
+      ok: true,
+      package_via: "esplora-sequential",
+      package_note: `submitpackage unavailable (${pkgErr.message || pkgErr}); broadcast sequentially`,
+      txids,
+      providers,
+    };
+  }
 }
 
 function esploraBases(network) {
@@ -346,10 +446,23 @@ function pushExpectBodyArg(args, expectBody) {
 }
 
 /** Map UI inscription plan → phechan CLI args (create | delegate | reinscribe). */
+/** Reveal / prepare sizing rate. Prefer revealFeeRate; fall back to legacy feeRate. */
+function revealFeeRateFromPlan(plan) {
+  const r = plan.revealFeeRate != null ? plan.revealFeeRate : plan.feeRate;
+  return r != null && Number(r) > 0 ? String(r) : "1";
+}
+
+/** Commit funding PSBT rate. Prefer commitFeeRate; fall back to legacy feeRate. */
+function commitFeeRateFromPlan(plan) {
+  const r = plan.commitFeeRate != null ? plan.commitFeeRate : plan.feeRate;
+  return r != null && Number(r) > 0 ? String(r) : "1";
+}
+
 function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
   const network = String(plan.network || "regtest");
   const mode = String(plan.mode || "text");
-  const feeRate = plan.feeRate != null ? String(plan.feeRate) : "1";
+  const feeRate = revealFeeRateFromPlan(plan);
+  const commitFeeRate = commitFeeRateFromPlan(plan);
   const postage = plan.postage != null ? String(plan.postage) : "546";
 
   let args;
@@ -435,6 +548,18 @@ function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
     }
   }
   args.push("--fee-rate", feeRate, "--postage", postage);
+  args.push("--commit-fee-rate", commitFeeRate);
+  // Align commit fee estimate with inscribe.dev (carrier + payment input sizes).
+  const hasCarrier = Boolean(
+    plan.satTarget ||
+      plan.sameSatParent ||
+      (plan.carrierTxid && plan.carrierValue != null) ||
+      (typeof plan.satTarget === "string" && /i\d+$/.test(String(plan.satTarget)))
+  );
+  if (hasCarrier) args.push("--commit-estimate-carrier");
+  // Payment address only (native or nested) — do not fall back to ordinals destination.
+  const payAddr = plan.paymentAddress || plan.changeAddress;
+  if (payAddr) args.push("--payment-address", String(payAddr));
 
   if (unsignedPsbt) args.push("--unsigned-psbt");
   else if (dryRun) args.push("--dry-run");
@@ -446,9 +571,12 @@ function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
 function planToRevealArgs(plan) {
   const args = planToCliArgs(plan, { dryRun: false, unsignedPsbt: false });
   const cleaned = args.filter((a) => a !== "--dry-run" && a !== "--unsigned-psbt");
-  // Same-sat: single-input reveal (parent already in commit) — broadcast directly.
-  // Different-sat FI/FO: half-signed PSBT; wallet signs parent.
-  if (plan.sameSatParent && plan.parentId) {
+  // Wallet self-custody (ordinals pubkey): always unsigned — wallet signs reveal.
+  // Different-sat FI/FO: half-signed / unsigned PSBT; wallet signs parent (+ commit if custody).
+  // Keystore automation (no pubkey, non-mainnet): CLI can broadcast directly.
+  if (plan.ordinalsPublicKey) {
+    cleaned.push("--unsigned-psbt");
+  } else if (plan.sameSatParent && plan.parentId) {
     cleaned.push("--broadcast");
   } else if (plan.parentId && plan.parentOutpoint) {
     cleaned.push("--unsigned-psbt");
@@ -461,7 +589,7 @@ function planToRevealArgs(plan) {
 
 function planToFundCommitArgs(plan) {
   const network = String(plan.network || "signet");
-  const feeRate = plan.feeRate != null ? String(plan.feeRate) : "1";
+  const feeRate = commitFeeRateFromPlan(plan);
   const args = [
     "inscription",
     "fund-commit",
@@ -1153,6 +1281,8 @@ async function handleApi(req, res) {
 
     if (url.pathname === "/api/inscription/prepare") {
       try {
+        const network = String(body.network || "signet");
+        requireWalletCustodyPubkey(body, network);
         const args = planToCliArgs(body, { dryRun: true, unsignedPsbt: false });
         const result = await runPhechan(args);
         cliResult(res, result);
@@ -1175,7 +1305,12 @@ async function handleApi(req, res) {
             [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
           },
         });
-        const feeRate = Number(body.feeRate) > 0 ? Number(body.feeRate) : 1;
+        const feeRate =
+          Number(body.revealFeeRate) > 0
+            ? Number(body.revealFeeRate)
+            : Number(body.feeRate) > 0
+              ? Number(body.feeRate)
+              : 1;
         const savedBytes = Math.max(0, raw.length - compressed.length);
         // Body lives in witness → ~1 weight unit per byte → vbytes ≈ bytes/4
         const savedVbytes = savedBytes / 4;
@@ -1209,6 +1344,8 @@ async function handleApi(req, res) {
           });
           return;
         }
+        const network = String(body.network || "signet");
+        requireWalletCustodyPubkey(body, network);
         const args = planToFundCommitArgs(body);
         const result = await runPhechan(args, { timeoutMs: 300_000 });
         cliResult(res, result);
@@ -1230,6 +1367,7 @@ async function handleApi(req, res) {
         }
         const net = String(body.network || "signet").toLowerCase();
         assertMainnetGate(body, net);
+        requireWalletCustodyPubkey(body, net);
         if (body.parentId && !body.parentOutpoint && !body.sameSatParent) {
           json(res, 400, {
             error:
@@ -1401,18 +1539,6 @@ async function handleApi(req, res) {
           args.push("--skip-ordinals-check");
         }
         if (doBroadcast) {
-          if (isMainnet(network)) {
-            assertMainnetGate(body, network);
-          } else if (network === "regtest" && String(body.confirm || "") !== "BROADCAST REGTEST") {
-            json(res, 400, { error: "type confirm exactly: BROADCAST REGTEST" });
-            return;
-          } else if (network === "signet" && String(body.confirm || "") !== "BROADCAST SIGNET") {
-            json(res, 400, { error: "type confirm exactly: BROADCAST SIGNET" });
-            return;
-          } else if (network === "testnet" && String(body.confirm || "") !== "BROADCAST TESTNET") {
-            json(res, 400, { error: "type confirm exactly: BROADCAST TESTNET" });
-            return;
-          }
           args.push("--broadcast");
           appendConfirmArg(args, body, network);
         }
@@ -1543,6 +1669,25 @@ async function handleApi(req, res) {
       return;
     }
 
+    if (url.pathname === "/api/tx/submit-package") {
+      try {
+        const network = String(body.network || "signet").toLowerCase();
+        assertMainnetGate(body, network);
+        const hexes = Array.isArray(body.hexes)
+          ? body.hexes
+          : [body.commitHex, body.revealHex].filter(Boolean);
+        if (hexes.length < 2) {
+          json(res, 400, { error: "commitHex + revealHex (or hexes[]) required" });
+          return;
+        }
+        const result = await broadcastPackage(network, hexes);
+        json(res, 200, result);
+      } catch (e) {
+        json(res, 400, { ok: false, error: String(e.message || e) });
+      }
+      return;
+    }
+
     if (url.pathname === "/api/inscription/unsigned-psbt") {
       const text = String(body.body || "Hello, world!");
       const network = String(body.network || "regtest");
@@ -1599,8 +1744,7 @@ async function handleApi(req, res) {
       ok: true,
       bind: HOST,
       note: "local-only; no key APIs",
-      mainnetUnlocked: String(process.env.PHECHAN_ALLOW_MAINNET_BROADCAST || "") === "1",
-      mainnetConfirm: MAINNET_PHRASE,
+      mainnetUnlocked: true,
       ordMainnet: "ordinals.com/r → ordiscan (optional PHECHAN_ORDISCAN_API_KEY) → PHECHAN_ORD_URL",
       ordOther: process.env.PHECHAN_ORD_URL || "regtest→:8081 signet→:8080",
       ordiscanKeyConfigured: Boolean(ordiscanKey()),

@@ -8,6 +8,11 @@ import {
   type InterruptedCommit,
 } from "./interrupted";
 import {
+  createCommitBundle,
+  downloadCommitBundle,
+  importCommitBundle,
+} from "./commitBundle";
+import {
   connectWallet,
   detectWallet,
   explorerTxUrl,
@@ -23,8 +28,30 @@ import {
 } from "./vanity";
 
 type VerifyUi = "idle" | "loading" | "ok" | "error";
-type FlowPhase = "idle" | "preparing" | "funding" | "review" | "grinding" | "done" | "error";
+type FlowPhase =
+  | "idle"
+  | "preparing"
+  | "funding"
+  | "review"
+  | "grinding"
+  | "committed"
+  | "done"
+  | "error";
 type AppPage = "inscribe" | "profile" | "studio";
+/** Fast = commit+reveal in one session. Control = fund now, reveal later (bundle). */
+type InscribePace = "fast" | "control";
+
+const PACE_KEY = "phechan.inscribePace";
+
+function readStoredPace(): InscribePace {
+  try {
+    const v = localStorage.getItem(PACE_KEY);
+    if (v === "control" || v === "fast") return v;
+  } catch {
+    /* ignore */
+  }
+  return "fast";
+}
 
 type SignReview = {
   kind: "funding" | "reveal";
@@ -46,6 +73,45 @@ function isWalletCancel(msg: string) {
 
 function isTransientError(msg: string) {
   return /timeout|network|fetch|ECONN|temporar|503|502|429|esplora/i.test(msg);
+}
+
+/** CLI fields may arrive as string | string[] when a key was printed more than once. */
+function cliScalar(v: unknown): string {
+  if (Array.isArray(v)) return String(v[0] ?? "");
+  if (v == null) return "";
+  return String(v);
+}
+
+function cliNumber(v: unknown): number {
+  const n = Number(cliScalar(v));
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Parse sat/vB from UI fields — supports fractional rates (0.1, 0.69, …) and any rate > 0. */
+function parseFeeRateInput(raw: unknown, fallback = 1): number {
+  const n = typeof raw === "number" ? raw : Number(String(raw ?? "").trim());
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Commit vbytes à la inscribe.dev (Wizards of Ord). Native + nested segwit. */
+function estimateCommitVbytesInscribe(opts: {
+  carrier: boolean;
+  paymentType: "p2wpkh" | "p2sh-p2wpkh" | "p2tr" | "unknown";
+}): number {
+  const base = 10.5 + 43; // base + commit P2TR out
+  const change =
+    opts.paymentType === "p2tr"
+      ? 43
+      : opts.paymentType === "p2sh-p2wpkh"
+        ? 32
+        : 31; // native P2WPKH (default for unknown)
+  const payIn =
+    opts.paymentType === "p2tr"
+      ? 57.5
+      : opts.paymentType === "p2sh-p2wpkh"
+        ? 91
+        : 67.75; // native P2WPKH
+  return Math.ceil(base + change + payIn + (opts.carrier ? 57.5 : 0));
 }
 
 function formatResult(data: CliResponse): string {
@@ -134,10 +200,32 @@ export default function App() {
   const [vanitySuffix, setVanitySuffix] = useState("");
   const [commitVanityPrefix, setCommitVanityPrefix] = useState("");
   const [commitVanitySuffix, setCommitVanitySuffix] = useState("");
-  const [feeRate, setFeeRate] = useState("1");
+  const [commitFeeRate, setCommitFeeRate] = useState("1");
+  const [revealFeeRate, setRevealFeeRate] = useState("1");
+  const [inscribePace, setInscribePace] = useState<InscribePace>(() => readStoredPace());
   const [postage, setPostage] = useState("546");
+  const [networkCost, setNetworkCost] = useState<{
+    status: "idle" | "loading" | "ok" | "error";
+    /** Miner fees only: reveal + estimated commit */
+    networkFeeSats?: number;
+    revealFeeSats?: number;
+    commitFeeSats?: number;
+    /** Postage — returned with inscription, not a miner fee */
+    postageSats?: number;
+    /** Amount to send to commit address = postage + reveal fee */
+    fundCommitSats?: number;
+    commitAddress?: string;
+    detail?: string;
+  }>({ status: "idle" });
   const [fundingUtxos, setFundingUtxos] = useState<
-    { txid: string; vout: number; value: number; scriptPubKey?: string; address?: string }[]
+    {
+      txid: string;
+      vout: number;
+      value: number;
+      scriptPubKey?: string;
+      address?: string;
+      confirmations?: number | null;
+    }[]
   >([]);
   const [selectedUtxoKey, setSelectedUtxoKey] = useState("");
   const [brotliStats, setBrotliStats] = useState<{
@@ -157,12 +245,13 @@ export default function App() {
     revealTxid?: string;
     inscriptionId?: string;
   } | null>(null);
-  /** Crash-recovery only — Inscribe keeps commit+reveal in one session */
+  /** Deferred reveal after commit broadcast (bundle downloaded; reveal on demand). */
   const [interrupted, setInterrupted] = useState<InterruptedCommit[]>(() =>
     listInterruptedCommits()
   );
+  const [pendingReveal, setPendingReveal] = useState<InterruptedCommit | null>(null);
+  const bundleFileRef = useRef<HTMLInputElement | null>(null);
   const [page, setPage] = useState<AppPage>("inscribe");
-  const [mainnetUnlocked, setMainnetUnlocked] = useState(false);
   const [signReview, setSignReview] = useState<SignReview | null>(null);
   const signReviewResolver = useRef<((go: boolean) => void) | null>(null);
 
@@ -170,17 +259,28 @@ export default function App() {
     setInterrupted(listInterruptedCommits());
   }, []);
 
+  const setPace = useCallback((pace: InscribePace) => {
+    setInscribePace(pace);
+    try {
+      localStorage.setItem(PACE_KEY, pace);
+    } catch {
+      /* ignore */
+    }
+    // Fast uses one rate — keep both fields aligned when switching back.
+    if (pace === "fast") {
+      setCommitFeeRate(revealFeeRate);
+    }
+  }, [revealFeeRate]);
+
+  const isControlPace = inscribePace === "control";
+
   const isMainnetNet =
     network.toLowerCase() === "mainnet" || network.toLowerCase() === "bitcoin";
   const isRegtestConnected =
     Boolean(address) && network.toLowerCase() === "regtest";
-  const MAINNET_PHRASE = "BROADCAST MAINNET";
-
-  /** Attached after user reviews disclosure — no typing. */
-  const mainnetConfirm = useCallback(() => {
-    if (!isMainnetNet) return undefined;
-    return mainnetUnlocked ? MAINNET_PHRASE : undefined;
-  }, [isMainnetNet, mainnetUnlocked, MAINNET_PHRASE]);
+  /** Reinscription: postage must equal the target UTXO value (not editable). */
+  const postageLocked =
+    satVerify === "ok" && satReinscribe && satResolvedValue != null && satResolvedValue > 0;
 
   const requestSignReview = useCallback((review: SignReview) => {
     setSignReview(review);
@@ -244,7 +344,6 @@ export default function App() {
       .health()
       .then((h) => {
         setHealth(h.ok ? `API ok @ ${h.bind}` : "API unhealthy");
-        setMainnetUnlocked(Boolean(h.mainnetUnlocked));
       })
       .catch(() => setHealth("API unreachable"));
     setWalletReady(detectWallet().available);
@@ -256,6 +355,12 @@ export default function App() {
     }
     refreshInterrupted();
   }, [refreshInterrupted]);
+
+  useEffect(() => {
+    if (postageLocked && satResolvedValue != null) {
+      setPostage(String(satResolvedValue));
+    }
+  }, [postageLocked, satResolvedValue]);
 
   useEffect(() => {
     if (page === "studio" && !isRegtestConnected) setPage("inscribe");
@@ -273,7 +378,8 @@ export default function App() {
           const r = await api.brotliPreview({
             body: mode === "text" ? body : undefined,
             contentBase64: mode === "upload" ? uploadB64 || undefined : undefined,
-            feeRate: Number(feeRate) || 1,
+            feeRate: parseFeeRateInput(revealFeeRate),
+            revealFeeRate: parseFeeRateInput(revealFeeRate),
           });
           if (cancelled || r.error) return;
           const savedBytes = Number(r.savedBytes) || 0;
@@ -296,7 +402,7 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [brotliEligible, mode, body, uploadB64, feeRate]);
+  }, [brotliEligible, mode, body, uploadB64, revealFeeRate]);
 
   const plan: InscribePlan = useMemo(() => {
     const satForEngine = satResolvedOutpoint || satTarget || undefined;
@@ -332,11 +438,19 @@ export default function App() {
       vanitySuffix: vanitySuffix || undefined,
       commitVanityPrefix: commitVanityPrefix || undefined,
       commitVanitySuffix: commitVanitySuffix || undefined,
-      feeRate: Number(feeRate) || 1,
-      postage: Number(postage) || 546,
+      commitFeeRate:
+        inscribePace === "fast"
+          ? parseFeeRateInput(revealFeeRate)
+          : parseFeeRateInput(commitFeeRate),
+      revealFeeRate: parseFeeRateInput(revealFeeRate),
+      /** Keep legacy field = reveal rate for older API paths / bundle readers */
+      feeRate: parseFeeRateInput(revealFeeRate),
+      postage: postageLocked
+        ? Number(satResolvedValue)
+        : Number(postage) || 546,
       destination: address || undefined,
-      paymentAddress: paymentAddress || address || undefined,
-      confirm: isMainnetNet && mainnetUnlocked ? MAINNET_PHRASE : undefined,
+      // Prefer wallet payment address (native or nested) — not ordinals taproot.
+      paymentAddress: paymentAddress || undefined,
     };
   }, [
     mode,
@@ -363,13 +477,108 @@ export default function App() {
     vanitySuffix,
     commitVanityPrefix,
     commitVanitySuffix,
-    feeRate,
+    commitFeeRate,
+    revealFeeRate,
+    inscribePace,
     postage,
+    postageLocked,
+    satResolvedValue,
     address,
     paymentAddress,
+  ]);
+
+  // Live network cost: debounce prepare (dry-run) as the plan changes.
+  useEffect(() => {
+    if (!address) {
+      setNetworkCost({ status: "idle", detail: "Connect wallet to estimate network cost" });
+      return;
+    }
+    if (isMainnetNet && !ordinalsPublicKey) {
+      setNetworkCost({
+        status: "error",
+        detail: "Reconnect wallet (need Ordinals public key for self-custody estimate)",
+      });
+      return;
+    }
+    const hasContent =
+      (mode === "text" && body.trim().length > 0) ||
+      (mode === "upload" && Boolean(uploadB64)) ||
+      (mode === "delegate" && delegateId.trim().length > 0);
+    if (!hasContent) {
+      setNetworkCost({ status: "idle", detail: "Add inscription content to estimate cost" });
+      return;
+    }
+
+    let cancelled = false;
+    setNetworkCost((prev) => ({ ...prev, status: "loading" }));
+    const t = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const prep = await api.prepareInscription(plan);
+          if (cancelled) return;
+          if (prep.error && !(cliScalar(prep.commit_sats) || cliScalar(prep.commit_address))) {
+            setNetworkCost({
+              status: "error",
+              detail: String(prep.error).slice(0, 180),
+            });
+            return;
+          }
+          const commitSats = cliNumber(prep.commit_sats);
+          const postageSats = cliNumber(prep.postage_sats) || cliNumber(postage);
+          const revealFeeSats = cliNumber(prep.reveal_fee_sats);
+          const commitFeeSats =
+            cliNumber(prep.commit_fee_estimate_sats) ||
+            Math.ceil(
+              estimateCommitVbytesInscribe({
+                carrier: Boolean(
+                  satTarget.trim() || satResolvedOutpoint || plan.sameSatParent
+                ),
+                paymentType: payType,
+              }) * parseFeeRateInput(commitFeeRate)
+            );
+          const networkFeeSats =
+            cliNumber(prep.network_fee_sats) ||
+            (revealFeeSats + commitFeeSats);
+          setNetworkCost({
+            status: "ok",
+            networkFeeSats: networkFeeSats || undefined,
+            revealFeeSats: revealFeeSats || undefined,
+            commitFeeSats: commitFeeSats || undefined,
+            postageSats: postageSats || undefined,
+            fundCommitSats:
+              commitSats > 0
+                ? commitSats
+                : postageSats + revealFeeSats > 0
+                  ? postageSats + revealFeeSats
+                  : undefined,
+            commitAddress: cliScalar(prep.commit_address) || undefined,
+            detail: undefined,
+          });
+        } catch (e) {
+          if (cancelled) return;
+          setNetworkCost({ status: "error", detail: String(e).slice(0, 180) });
+        }
+      })();
+    }, 450);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [
+    address,
     isMainnetNet,
-    mainnetUnlocked,
-    MAINNET_PHRASE,
+    ordinalsPublicKey,
+    mode,
+    body,
+    uploadB64,
+    delegateId,
+    plan,
+    postage,
+    commitFeeRate,
+    satTarget,
+    satResolvedOutpoint,
+    plan.sameSatParent,
+    payType,
   ]);
 
   const sameSatParent = Boolean(plan.sameSatParent);
@@ -405,16 +614,23 @@ export default function App() {
     async (
       commitTxid: string,
       expectedCommitAddress: string | undefined,
-      planOverride?: InscribePlan
+      planOverride?: InscribePlan,
+      opts?: { commitHexForPackage?: string }
     ) => {
       const activePlan = planOverride || plan;
       const sameSat = Boolean(activePlan.sameSatParent);
       const differentSat = Boolean(
         activePlan.parentId && activePlan.parentOutpoint && !sameSat
       );
+      const atomicPackage = Boolean(opts?.commitHexForPackage);
 
       if (!address) {
         throw new Error("Connect wallet first");
+      }
+      if (isMainnetNet && !(activePlan.ordinalsPublicKey || ordinalsPublicKey)) {
+        throw new Error(
+          "Mainnet self-custody requires your Ordinals public key. Reconnect Xverse (Ordinals + Payment)."
+        );
       }
       if (activePlan.parentId) {
         if (!sameSat && (!activePlan.parentOutpoint || activePlan.parentValue == null)) {
@@ -433,7 +649,7 @@ export default function App() {
         if (prep.error) {
           throw new Error(String(prep.error));
         }
-        const nowAddr = String(prep.commit_address || "");
+        const nowAddr = cliScalar(prep.commit_address);
         const expect = expectedCommitAddress || "";
         if (expect && nowAddr && expect !== nowAddr) {
           throw new Error(
@@ -455,9 +671,15 @@ export default function App() {
       setFlowPhase("grinding");
       const grindMsg = hasRevealVanity
         ? `Grinding reveal TXID ${activePlan.vanityPrefix || ""}…${activePlan.vanitySuffix || ""}`
-        : "Building & broadcasting reveal…";
+        : atomicPackage
+          ? "Building reveal for atomic package…"
+          : "Building & broadcasting reveal…";
       setGrindNote(grindMsg);
-      setOut(`Commit funded: ${commitTxid}\n${grindMsg}`);
+      setOut(
+        atomicPackage
+          ? `Commit signed (held for package): ${commitTxid}\n${grindMsg}`
+          : `Commit funded: ${commitTxid}\n${grindMsg}`
+      );
 
       let rev: Awaited<ReturnType<typeof api.revealInscription>> | null = null;
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -490,7 +712,7 @@ export default function App() {
         throw new Error(`Reveal failed.\nCommit unspent: ${commitTxid}`);
       }
 
-      const parentChildPsbt = Boolean(differentSat && rev.psbt_base64);
+      const walletRevealPsbt = Boolean(rev.psbt_base64) && !rev.reveal_txid && !rev.broadcast_txid;
       let revealTxid = "";
 
       if (differentSat && !rev.psbt_base64 && !rev.reveal_txid && !rev.broadcast_txid) {
@@ -503,21 +725,32 @@ export default function App() {
         );
       }
 
-      if (parentChildPsbt) {
+      if (walletRevealPsbt) {
         const inspected = await api.inspectPsbt({
           base64: String(rev.psbt_base64),
           network: activePlan.network || network,
         });
+        const custodyNote = Boolean(activePlan.ordinalsPublicKey || ordinalsPublicKey);
         const go = await requestSignReview({
           kind: "reveal",
-          headline: "Review reveal (parent spend) before wallet sign",
+          headline: differentSat
+            ? "Review reveal (parent spend) before wallet sign"
+            : "Review reveal before wallet sign",
           steps: [
-            `Commit already broadcast: ${commitTxid}`,
-            "This PSBT spends the parent UTXO (vin0) + commit (vin1).",
-            String(rev.parent_lands || "Parent returns on vout0 (vault)."),
-            String(rev.child_lands || "Child lands on vout1 (postage)."),
-            "Xverse will ask you to sign the Ordinals (parent) input.",
-            "After you approve here, the wallet popup opens — then we broadcast via Esplora.",
+            atomicPackage
+              ? `Commit held for atomic package: ${commitTxid}`
+              : `Commit already broadcast: ${commitTxid}`,
+            differentSat
+              ? "This PSBT spends the parent UTXO (vin0) + commit (vin1)."
+              : "This PSBT spends the commit via inscription tapscript.",
+            String(rev.parent_lands || ""),
+            String(rev.child_lands || "Inscription lands on postage output."),
+            custodyNote
+              ? "Self-custody: tapscript uses your wallet pubkey — only you can sign/reveal/recover (key-path)."
+              : "Sign the required inputs in your wallet.",
+            atomicPackage
+              ? "After you approve, we submitpackage commit+reveal together (or sequential Esplora fallback)."
+              : "After you approve here, the wallet popup opens — then we broadcast via Esplora.",
           ].filter(Boolean),
           warnings: isMainnetNet
             ? ["Mainnet — real BTC. Wallet will show the same inputs/outputs."]
@@ -535,61 +768,122 @@ export default function App() {
         });
         if (!go) {
           throw new Error(
-            `Cancelled before reveal sign.\nCommit unspent: ${commitTxid}\nOpen Profile → Send reveal to finish later.`
+            atomicPackage
+              ? `Cancelled before reveal sign.\nCommit not broadcast yet: ${commitTxid}\nNothing left the wallet.`
+              : `Cancelled before reveal sign.\nCommit unspent: ${commitTxid}\nOpen Profile → Send reveal to finish later.`
           );
         }
         setSignReview(null);
+
+        // Parent FI/FO: vin0 = parent. Wallet custody single-input: vin0 = commit.
+        // Sign all inputs owned by the ordinals address.
+        const signIdx: number[] = differentSat ? [0, 1] : [0];
+        // If keystore pre-signed commit (vin1), wallet only needs parent (vin0).
+        const parentOnly =
+          differentSat &&
+          !custodyNote &&
+          String(rev.note || rev.fields?.note || "").toLowerCase().includes("keystore");
+        const indices = parentOnly ? [0] : differentSat && custodyNote ? [0, 1] : signIdx;
 
         let signedPsbt = "";
         for (let round = 1; ; round++) {
           setOut(
             [
-              `Commit funded: ${commitTxid}`,
+              atomicPackage
+                ? `Commit held: ${commitTxid}`
+                : `Commit funded: ${commitTxid}`,
               String(rev.parent_lands || ""),
               String(rev.child_lands || ""),
               round === 1
-                ? "Sign parent input in wallet (ordinals) to finish inscription…"
-                : `Wallet cancelled — prompt ${round}: approve Ordinals sign to finish (commit already broadcast).`,
+                ? "Sign reveal in wallet to finish inscription…"
+                : atomicPackage
+                  ? `Wallet cancelled — prompt ${round}: approve sign (commit still not broadcast).`
+                  : `Wallet cancelled — prompt ${round}: approve sign to finish (commit already broadcast).`,
             ]
               .filter(Boolean)
               .join("\n")
           );
           const signedReveal = await signPsbtWithWallet(String(rev.psbt_base64), {
             broadcast: false,
-            signInputs: { [address]: [0] },
+            signInputs: { [address]: indices },
           });
           if (signedReveal.ok && signedReveal.psbt) {
             signedPsbt = signedReveal.psbt;
             break;
           }
-          const msg = signedReveal.message || "Wallet did not sign parent input";
+          const msg = signedReveal.message || "Wallet did not sign reveal";
           if (isWalletCancel(msg)) {
             continue;
           }
-          throw new Error(`${msg}\n\nCommit unspent: ${commitTxid}`);
+          throw new Error(
+            atomicPackage
+              ? `${msg}\n\nCommit not broadcast — safe to retry.`
+              : `${msg}\n\nCommit unspent: ${commitTxid}`
+          );
         }
 
-        setOut("Parent signed — broadcasting reveal via Esplora…");
-        let fin: Awaited<ReturnType<typeof api.finalizeFundingPsbt>> | null = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          fin = await api.finalizeFundingPsbt({
+        if (atomicPackage && opts?.commitHexForPackage) {
+          setOut("Wallet signed — finalizing reveal & submitting atomic package…");
+          const fin = await api.finalizeFundingPsbt({
             base64: signedPsbt,
             network: activePlan.network || network,
-            broadcast: true,
-            confirm:
-              activePlan.confirm ||
-              mainnetConfirm() ||
-              undefined,
+            broadcast: false,
           });
-          revealTxid = String(fin.broadcast_txid || "");
-          if (fin.ok && revealTxid) break;
-          const err = String(fin.error || fin.stderr || "Reveal broadcast failed");
-          if (attempt < 4 && isTransientError(err)) {
-            setOut(`Broadcast retry ${attempt + 1}… (${err})`);
-            await sleep(1200 * (attempt + 1));
-            continue;
+          const revealHex = String(fin.hex || "");
+          if (!fin.ok || !revealHex) {
+            throw new Error(
+              String(fin.error || fin.stderr || "Reveal finalize produced no hex")
+            );
           }
-          throw new Error(`${err}\n\nCommit unspent: ${commitTxid}\n${formatResult(fin)}`);
+          const plannedReveal = String(fin.txid || "");
+          const pkg = await api.submitPackage({
+            network: activePlan.network || network,
+            commitHex: opts.commitHexForPackage,
+            revealHex,
+          });
+          if (!pkg.ok && pkg.error) {
+            throw new Error(String(pkg.error));
+          }
+          const txids = Array.isArray(pkg.txids) ? pkg.txids : [];
+          revealTxid =
+            txids[1] ||
+            txids.find((t) => t !== commitTxid) ||
+            plannedReveal ||
+            "";
+          if (!revealTxid) {
+            throw new Error(
+              `Package submitted (${pkg.package_via || "?"}) but no reveal txid.\n${formatResult(pkg)}`
+            );
+          }
+          setOut(
+            [
+              `Atomic package via ${pkg.package_via || "unknown"}`,
+              pkg.package_note || "",
+              `commit: ${txids[0] || commitTxid}`,
+              `reveal: ${revealTxid}`,
+            ]
+              .filter(Boolean)
+              .join("\n")
+          );
+        } else {
+          setOut("Wallet signed — broadcasting reveal via Esplora…");
+          let fin: Awaited<ReturnType<typeof api.finalizeFundingPsbt>> | null = null;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            fin = await api.finalizeFundingPsbt({
+              base64: signedPsbt,
+              network: activePlan.network || network,
+              broadcast: true,
+            });
+            revealTxid = String(fin.broadcast_txid || "");
+            if (fin.ok && revealTxid) break;
+            const err = String(fin.error || fin.stderr || "Reveal broadcast failed");
+            if (attempt < 4 && isTransientError(err)) {
+              setOut(`Broadcast retry ${attempt + 1}… (${err})`);
+              await sleep(1200 * (attempt + 1));
+              continue;
+            }
+            throw new Error(`${err}\n\nCommit unspent: ${commitTxid}\n${formatResult(fin)}`);
+          }
         }
       } else {
         revealTxid = String(rev.reveal_txid || rev.broadcast_txid || "");
@@ -613,6 +907,7 @@ export default function App() {
 
       removeInterruptedCommit(commitTxid);
       refreshInterrupted();
+      setPendingReveal(null);
       setSignReview(null);
       setFlowPhase("done");
       setResultTx({ commitTxid, revealTxid, inscriptionId });
@@ -644,7 +939,6 @@ export default function App() {
       ordinalsPublicKey,
       network,
       isMainnetNet,
-      mainnetConfirm,
       requestSignReview,
       refreshInterrupted,
     ]
@@ -657,17 +951,17 @@ export default function App() {
       setFlowPhase("error");
       return;
     }
-    if (isMainnetNet && !mainnetUnlocked) {
-      setOk(false);
-      setOut(
-        "Mainnet locked. Restart the local API with PHECHAN_ALLOW_MAINNET_BROADCAST=1, then review the disclosure and Sign."
-      );
-      setFlowPhase("error");
-      return;
-    }
     if (mode === "delegate" && !delegateId.trim()) {
       setOk(false);
       setOut("Delegate ID required.");
+      setFlowPhase("error");
+      return;
+    }
+    if (isMainnetNet && !ordinalsPublicKey) {
+      setOk(false);
+      setOut(
+        "Mainnet self-custody requires your Ordinals public key. Connect/reconnect Xverse (Ordinals + Payment)."
+      );
       setFlowPhase("error");
       return;
     }
@@ -682,11 +976,11 @@ export default function App() {
 
     try {
       const prep = await api.prepareInscription(plan);
-      if (prep.error && !(prep.commit_address && prep.commit_sats)) {
+      if (prep.error && !(cliScalar(prep.commit_address) && cliNumber(prep.commit_sats))) {
         throw new Error(String(prep.error));
       }
-      const commitAddress = String(prep.commit_address || "");
-      const commitSats = Number(prep.commit_sats || 0);
+      const commitAddress = cliScalar(prep.commit_address);
+      const commitSats = cliNumber(prep.commit_sats);
       if (!commitAddress || !commitSats) {
         throw new Error(
           `Prepare failed — missing commit_address/commit_sats.\n${formatResult(prep)}`
@@ -730,7 +1024,10 @@ export default function App() {
         );
       }
 
-      const feeR = Number(feeRate) || 1;
+      const feeR =
+        inscribePace === "fast"
+          ? parseFeeRateInput(revealFeeRate)
+          : parseFeeRateInput(commitFeeRate);
       // Reinscription / same-sat: inscription UTXO must be vin0 so the sat moves into commit.
       // Payment alone only creates a NEW sat inscription — sat target would be ignored.
       const useSatCarrier = Boolean(
@@ -899,19 +1196,34 @@ export default function App() {
         `Content: ${modeLabel}`,
         parentId.trim()
           ? sameSatParent
-            ? `Same-sat child on parent ${parentId.trim()} — parent UTXO funds commit; one wallet sign; reveal has no second sign.`
-            : `Different-sat child of ${parentId.trim()} — sign #1 funds commit (Payment); after broadcast, sign #2 spends parent (Ordinals).`
+            ? `Same-sat child on parent ${parentId.trim()} — parent UTXO funds commit; one wallet sign${
+                isControlPace ? "; reveal later when you choose" : "; then automatic reveal"
+              }.`
+            : `Different-sat child of ${parentId.trim()} — sign #1 funds commit (Payment)${
+                isControlPace
+                  ? "; reveal later signs parent (Ordinals)."
+                  : "; after broadcast, sign #2 spends parent (Ordinals)."
+              }`
           : useSatCarrier
             ? `Reinscription on sat UTXO ${carrierOutpoint} — ordinals vin0 moves the sat into commit${needPaymentTopUp ? "; payment top-up vin1" : ""}.`
-            : "Standalone inscription — one funding sign, then automatic reveal.",
+            : isControlPace
+              ? "Standalone inscription — fund commit now; reveal when you choose (bundle auto-downloads)."
+              : "Standalone inscription — one funding sign, then automatic reveal.",
         `Commit output: ${commitSats} sats → ${commitAddress}`,
-        `Fee rate ${feeR} sat/vB · postage ${postage} sats`,
+        isControlPace
+          ? `Commit fee ${feeR} sat/vB · reveal budget ${parseFeeRateInput(revealFeeRate)} sat/vB · postage ${postage} sats`
+          : `Fee rate ${feeR} sat/vB · postage ${postage} sats`,
         useSatCarrier
           ? needPaymentTopUp
             ? "Wallet will sign Ordinals (vin0 / inscription sat) + Payment (vin1) in one prompt."
             : "Wallet will sign Ordinals (inscription sat as vin0) only."
           : "Wallet will sign Payment funding input.",
         "Nothing is broadcast until you approve below and then approve in Xverse.",
+        ...(isControlPace
+          ? [
+              "After commit confirms in mempool/chain, a .phechan.json bundle downloads — reveal is not automatic.",
+            ]
+          : []),
       ];
       const go = await requestSignReview({
         kind: "funding",
@@ -934,9 +1246,11 @@ export default function App() {
               ? `preview txid ${inspected.unsigned_txid}`
               : "",
         ].filter(Boolean),
-        buttonLabel: parentChildDifferentSat
-          ? "Sign funding & continue"
-          : "Sign & Inscribe",
+        buttonLabel: isControlPace
+          ? "Sign & broadcast commit"
+          : parentChildDifferentSat
+            ? "Sign funding & continue"
+            : "Sign & Inscribe",
       });
       if (!go) {
         setOk(null);
@@ -978,63 +1292,134 @@ export default function App() {
         throw new Error(msg);
       }
 
-      let commitTxid = signedTxid;
-      if (!commitTxid && signedPsbt) {
-        setOut("Wallet signed — broadcasting funding via Esplora…");
+      let commitTxid = "";
+      let commitHexForPackage: string | undefined;
+      const useAtomicPackage = Boolean(ordinalsPublicKey) && !isControlPace;
+
+      if (signedPsbt) {
+        setOut(
+          useAtomicPackage
+            ? "Wallet signed — finalizing commit (held for atomic package)…"
+            : "Wallet signed — broadcasting funding via Esplora…"
+        );
         const fin = await api.finalizeFundingPsbt({
           base64: signedPsbt,
           network,
-          broadcast: true,
+          broadcast: !useAtomicPackage,
           paymentPublicKey: paymentPublicKey || undefined,
-          confirm: mainnetConfirm(),
         });
-        const broadcasted = String(fin.broadcast_txid || "");
-        if (!fin.ok || !broadcasted) {
-          throw new Error(
-            String(
-              fin.error ||
-                fin.stderr ||
-                `Funding broadcast failed.\n${formatResult(fin)}`
-            )
-          );
+        if (useAtomicPackage) {
+          commitHexForPackage = String(fin.hex || "");
+          commitTxid = String(fin.txid || signedTxid || "");
+          if (!fin.ok || !commitHexForPackage || !commitTxid) {
+            throw new Error(
+              String(
+                fin.error ||
+                  fin.stderr ||
+                  `Commit finalize failed (needed for atomic package).\n${formatResult(fin)}`
+              )
+            );
+          }
+        } else {
+          const broadcasted = String(fin.broadcast_txid || signedTxid || "");
+          if (!fin.ok || !broadcasted) {
+            throw new Error(
+              String(
+                fin.error ||
+                  fin.stderr ||
+                  `Funding broadcast failed.\n${formatResult(fin)}`
+              )
+            );
+          }
+          commitTxid = broadcasted;
         }
-        commitTxid = broadcasted;
+      } else if (signedTxid) {
+        commitTxid = signedTxid;
       }
       if (!commitTxid) {
         throw new Error(
-          "Wallet signed but returned no PSBT/txid — cannot broadcast funding"
+          "Wallet signed but returned no PSBT/txid — cannot continue funding"
         );
       }
 
-      // Commit is on-chain — keep a snapshot so Profile can finish if this tab dies.
-      upsertInterruptedCommit({
+      // Snapshot so Profile can finish if reveal fails / is deferred.
+      const savedPlan = snapshotPlan({
+        ...plan,
+        destination: address,
+        vaultAddress: address,
+        parentAddress: parentAddress || address,
+        ordinalsPublicKey: ordinalsPublicKey || undefined,
+        sameSatParent: sameSatParent || undefined,
+        commitTxid,
+        commitValue: commitSats,
+      });
+      const interruptedItem: InterruptedCommit = {
         commitTxid,
         commitAddress,
         network,
         savedAt: Date.now(),
-        plan: snapshotPlan({
-          ...plan,
-          destination: address,
-          vaultAddress: address,
-          parentAddress: parentAddress || address,
-          ordinalsPublicKey: ordinalsPublicKey || undefined,
-          sameSatParent: sameSatParent || undefined,
-        }),
-      });
-      refreshInterrupted();
+        plan: savedPlan,
+      };
+      if (!useAtomicPackage) {
+        upsertInterruptedCommit(interruptedItem);
+        refreshInterrupted();
+      }
 
+      if (isControlPace) {
+        setPendingReveal(interruptedItem);
+        const bundle = createCommitBundle({
+          commitTxid,
+          commitAddress,
+          network,
+          plan: savedPlan,
+          commitSats,
+        });
+        try {
+          downloadCommitBundle(bundle);
+        } catch (dlErr) {
+          console.warn("commit bundle auto-download failed", dlErr);
+        }
+
+        setResultTx({ commitTxid });
+        setFlowPhase("committed");
+        setOk(true);
+        setOut(
+          [
+            `Commit broadcast: ${commitTxid}`,
+            `Bundle downloaded — keep the .phechan.json file safe.`,
+            `Reveal fee was pre-funded at ~${parseFeeRateInput(revealFeeRate)} sat/vB (commit funded at ~${feeR} sat/vB).`,
+            `Reveal when ready: Reveal now below, Profile → Send reveal, or Upload bundle on Profile.`,
+          ].join("\n")
+        );
+        return;
+      }
+
+      // Fast: chain reveal in the same session (atomic package when wallet self-custody).
+      setPendingReveal(null);
       setOut(
-        useSatCarrier
-          ? `Commit broadcast: ${commitTxid}\nReveal — target sat already in commit…`
-          : `Commit broadcast: ${commitTxid}\nFinishing reveal (same Inscribe flow)…`
+        useAtomicPackage
+          ? useSatCarrier
+            ? `Commit held for package: ${commitTxid}\nReveal — target sat already in commit…`
+            : `Commit held for package: ${commitTxid}\nSigning reveal for atomic submitpackage…`
+          : useSatCarrier
+            ? `Commit broadcast: ${commitTxid}\nReveal — target sat already in commit…`
+            : `Commit broadcast: ${commitTxid}\nFinishing reveal (fast mode)…`
       );
       try {
-        await runRevealFromCommit(commitTxid, commitAddress);
+        await runRevealFromCommit(
+          commitTxid,
+          commitAddress,
+          undefined,
+          commitHexForPackage ? { commitHexForPackage } : undefined
+        );
       } catch (revealErr) {
-        // Still interrupted in store — Profile can finish. Stay explicit.
-        refreshInterrupted();
+        if (!useAtomicPackage) {
+          refreshInterrupted();
+        }
         throw new Error(
-          `${String(revealErr)}\n\nCommit is broadcast. Open Profile → Send reveal to finish without funding again.`
+          useAtomicPackage
+            ? `${String(revealErr)}\n\nCommit was not broadcast — nothing stuck on-chain. Retry Inscribe.`
+            : `${String(revealErr)}\n\nCommit is broadcast. Open Profile → Send reveal to finish without funding again.`
         );
       }
     } catch (e) {
@@ -1055,7 +1440,10 @@ export default function App() {
     delegateId,
     uploadName,
     plan,
-    feeRate,
+    commitFeeRate,
+    revealFeeRate,
+    inscribePace,
+    isControlPace,
     postage,
     fundingUtxos,
     selectedUtxoKey,
@@ -1076,8 +1464,6 @@ export default function App() {
     runRevealFromCommit,
     refreshInterrupted,
     isMainnetNet,
-    mainnetUnlocked,
-    mainnetConfirm,
     requestSignReview,
   ]);
 
@@ -1087,27 +1473,19 @@ export default function App() {
       setOut("Connect wallet first");
       return;
     }
-    const itemNet = String(item.plan.network || network).toLowerCase();
-    const itemMainnet = itemNet === "mainnet" || itemNet === "bitcoin";
-    if (itemMainnet && !mainnetUnlocked) {
-      setOk(false);
-      setOut(
-        "Mainnet locked. Restart the local API with PHECHAN_ALLOW_MAINNET_BROADCAST=1."
-      );
-      return;
-    }
     setBusy(true);
     setOk(null);
     setPage("inscribe");
+    setPendingReveal(item);
     try {
       const p: InscribePlan = {
         ...item.plan,
         destination: address,
         vaultAddress: address,
         ordinalsPublicKey: ordinalsPublicKey || item.plan.ordinalsPublicKey,
-        confirm: itemMainnet ? MAINNET_PHRASE : item.plan.confirm,
       };
       await runRevealFromCommit(item.commitTxid, item.commitAddress, p);
+      setPendingReveal(null);
     } catch (e) {
       setFlowPhase("error");
       setOk(false);
@@ -1117,6 +1495,47 @@ export default function App() {
     } finally {
       setBusy(false);
       setGrindNote("");
+    }
+  }
+
+  function redownloadBundle(item: InterruptedCommit) {
+    const bundle = createCommitBundle({
+      commitTxid: item.commitTxid,
+      commitAddress: item.commitAddress,
+      network: item.network,
+      plan: item.plan,
+      commitSats: item.plan.commitValue,
+    });
+    downloadCommitBundle(bundle);
+    setOut(`Re-downloaded bundle for ${item.commitTxid.slice(0, 12)}…`);
+  }
+
+  async function onUploadCommitBundle(file: File | null) {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setOk(false);
+      setOut("Bundle file too large (max 2 MB).");
+      return;
+    }
+    try {
+      const text = await file.text();
+      const item = importCommitBundle(text);
+      refreshInterrupted();
+      setPendingReveal(item);
+      setOk(true);
+      setOut(
+        [
+          `Imported commit bundle: ${item.commitTxid}`,
+          `Network: ${item.network}`,
+          `Use Send reveal on Profile (or Reveal now) when ready.`,
+        ].join("\n")
+      );
+      setPage("profile");
+    } catch (e) {
+      setOk(false);
+      setOut(String(e));
+    } finally {
+      if (bundleFileRef.current) bundleFileRef.current.value = "";
     }
   }
 
@@ -1232,7 +1651,12 @@ export default function App() {
       setSatReinscribe(Boolean(r.reinscribe));
       if (r.txid != null && r.vout != null) setSatResolvedOutpoint(`${r.txid}:${r.vout}`);
       const val = typeof r.value === "number" ? r.value : Number(r.value);
-      setSatResolvedValue(Number.isFinite(val) ? val : null);
+      if (Number.isFinite(val)) {
+        setSatResolvedValue(val);
+        if (r.reinscribe) setPostage(String(val));
+      } else {
+        setSatResolvedValue(null);
+      }
     } else {
       setSatVerify("error");
       setSatMsg(r.error || r.detail || "Not verified");
@@ -1323,14 +1747,31 @@ export default function App() {
 
       {page === "profile" ? (
         <section className="panel">
-          <h2>Profile — interrupted commits</h2>
+          <h2>Profile — deferred commits</h2>
           <p className="field-help">
-            Prepare Inscribe shows txn I/O for review before any Xverse popup, then finishes
-            commit+reveal in one go. This list is only if the tab died or reveal still failed
-            after retries — <strong>Send reveal</strong> reviews/signs/broadcasts without funding again.
+            {isControlPace
+              ? "Control mode downloads a .phechan.json after commit. Keep it safe, then Send reveal here (or Upload bundle). Works on whatever network your wallet is connected to."
+              : "Fast mode finishes reveal in one session. This list is crash recovery if reveal failed after commit — Send reveal finishes without funding again. Switch Inscribe → Control for deferred reveal + bundles."}
           </p>
+          <div className="verify-row" style={{ marginBottom: "1rem" }}>
+            <input
+              ref={bundleFileRef}
+              type="file"
+              accept=".json,.phechan.json,application/json"
+              style={{ display: "none" }}
+              onChange={(e) => void onUploadCommitBundle(e.target.files?.[0] || null)}
+            />
+            <button
+              type="button"
+              className="ghost"
+              disabled={busy}
+              onClick={() => bundleFileRef.current?.click()}
+            >
+              Upload bundle
+            </button>
+          </div>
           {!interrupted.length ? (
-            <p className="muted">No interrupted commits.</p>
+            <p className="muted">No deferred commits. Inscribe → commit, or upload a bundle.</p>
           ) : (
             <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
               {interrupted.map((item) => (
@@ -1354,6 +1795,9 @@ export default function App() {
                         ? " · parent-child FI/FO"
                         : ""}
                     {item.plan.parentId ? ` · parent ${item.plan.parentId}` : ""}
+                    {item.plan.revealFeeRate != null || item.plan.feeRate != null
+                      ? ` · reveal budget ~${item.plan.revealFeeRate ?? item.plan.feeRate} sat/vB`
+                      : ""}
                   </p>
                   <div className="verify-row">
                     <button
@@ -1368,8 +1812,19 @@ export default function App() {
                       type="button"
                       className="ghost"
                       disabled={busy}
+                      onClick={() => redownloadBundle(item)}
+                    >
+                      Download bundle
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={busy}
                       onClick={() => {
                         removeInterruptedCommit(item.commitTxid);
+                        if (pendingReveal?.commitTxid === item.commitTxid) {
+                          setPendingReveal(null);
+                        }
                         refreshInterrupted();
                       }}
                     >
@@ -1395,6 +1850,29 @@ export default function App() {
       {page === "inscribe" ? (
       <section className="panel">
         <h2>Inscribe</h2>
+        <div className="pace-toggle" role="group" aria-label="Inscribe pace">
+          <button
+            type="button"
+            className={inscribePace === "fast" ? "pace active" : "pace"}
+            disabled={busy || Boolean(signReview)}
+            onClick={() => setPace("fast")}
+          >
+            Fast
+          </button>
+          <button
+            type="button"
+            className={inscribePace === "control" ? "pace active" : "pace"}
+            disabled={busy || Boolean(signReview)}
+            onClick={() => setPace("control")}
+          >
+            Control
+          </button>
+        </div>
+        <p className="field-help" style={{ marginTop: 0 }}>
+          {isControlPace
+            ? "Control — commit now at a low fee, download a .phechan.json bundle, reveal later (any network your wallet is on)."
+            : "Fast — commit and reveal in one session (classic flow). Profile still recovers if reveal fails mid-way."}
+        </p>
         <div className="mode-row">
           {(
             [
@@ -1547,7 +2025,7 @@ export default function App() {
                   </div>
                   {brotliStats.savedBytes > 0 ? (
                     <div>
-                      Est. fee save ≈ <strong>{brotliStats.savedFeeSats}</strong> sats at {feeRate}{" "}
+                      Est. fee save ≈ <strong>{brotliStats.savedFeeSats}</strong> sats at {revealFeeRate}{" "}
                       sat/vB (~{brotliStats.savedVbytes} vB witness)
                     </div>
                   ) : (
@@ -1863,35 +2341,104 @@ export default function App() {
             </div>
           )}
 
-          <div className="row two">
-            <div>
-              <label htmlFor="fee">Fee rate (sats/vB)</label>
-              <p className="field-help">
-                Applies to <em>both</em> commit funding PSBT and reveal. Fractional rates
-                (e.g. 0.69) are fine — we broadcast via public Esplora like sort-utxo / runes-etch
-                (local bitcoind minrelay is often 1 sat/vB and is only a fallback).
-              </p>
-              <input
-                id="fee"
-                value={feeRate}
-                onChange={(e) => setFeeRate(e.target.value)}
-                inputMode="decimal"
-              />
+          {isControlPace ? (
+            <div className="row two">
+              <div>
+                <label htmlFor="commit-fee">Commit fee rate (sats/vB)</label>
+                <p className="field-help">
+                  Pays the <em>funding</em> transaction only. Use a low rate when you are not in a hurry
+                  to confirm the commit.
+                </p>
+                <input
+                  id="commit-fee"
+                  value={commitFeeRate}
+                  onChange={(e) => setCommitFeeRate(e.target.value)}
+                  inputMode="decimal"
+                />
+              </div>
+              <div>
+                <label htmlFor="reveal-fee">Reveal fee rate (sats/vB)</label>
+                <p className="field-help">
+                  Sizes how many sats go into the commit output (postage + reveal fee). Use a higher
+                  rate if you expect to reveal later under congestion (e.g. a palindromic block).
+                </p>
+                <input
+                  id="reveal-fee"
+                  value={revealFeeRate}
+                  onChange={(e) => setRevealFeeRate(e.target.value)}
+                  inputMode="decimal"
+                />
+              </div>
             </div>
-            <div>
-              <label htmlFor="postage">Postage (sats)</label>
-              <p className="field-help">
-                Inscription output value (padding). Examples: 330 / 545 / 546 (≥ ~330 dust).
-              </p>
-              <input
-                id="postage"
-                value={postage}
-                onChange={(e) => setPostage(e.target.value)}
-                inputMode="numeric"
-                placeholder="546"
-              />
+          ) : (
+            <div className="row two">
+              <div>
+                <label htmlFor="fee">Fee rate (sats/vB)</label>
+                <p className="field-help">
+                  Applies to <em>both</em> commit funding and reveal sizing (fast mode).
+                </p>
+                <input
+                  id="fee"
+                  value={revealFeeRate}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setRevealFeeRate(v);
+                    setCommitFeeRate(v);
+                  }}
+                  inputMode="decimal"
+                />
+              </div>
+              <div>
+                <label htmlFor="postage-fast">Postage (sats)</label>
+                <p className="field-help">
+                  {postageLocked
+                    ? "Locked to the target inscription UTXO value (reinscription)."
+                    : "Inscription output value (padding). Examples: 330 / 545 / 546 (≥ ~330 dust)."}
+                </p>
+                <input
+                  id="postage-fast"
+                  value={postage}
+                  onChange={(e) => setPostage(e.target.value)}
+                  inputMode="numeric"
+                  placeholder="546"
+                  disabled={postageLocked}
+                  readOnly={postageLocked}
+                />
+              </div>
             </div>
-          </div>
+          )}
+          {isControlPace ? (
+            <div className="row two">
+              <div>
+                <label htmlFor="postage">Postage (sats)</label>
+                <p className="field-help">
+                  {postageLocked
+                    ? "Locked to the target inscription UTXO value (reinscription)."
+                    : "Inscription output value (padding). Examples: 330 / 545 / 546 (≥ ~330 dust)."}
+                </p>
+                <input
+                  id="postage"
+                  value={postage}
+                  onChange={(e) => setPostage(e.target.value)}
+                  inputMode="numeric"
+                  placeholder="546"
+                  disabled={postageLocked}
+                  readOnly={postageLocked}
+                />
+              </div>
+              <div>
+                <p className="field-help" style={{ marginTop: "1.6rem" }}>
+                  Fractional rates (e.g. 0.69) are fine — broadcast via public Esplora like sort-utxo /
+                  runes-etch.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <p className="field-help">
+              Fractional rates (e.g. 0.69) are fine — broadcast via public Esplora like sort-utxo /
+              runes-etch.
+            </p>
+          )}
         </details>
 
         <div className="actions">
@@ -1916,6 +2463,62 @@ export default function App() {
           >
             Prepare Inscribe
           </button>
+        </div>
+        <div className="network-cost" aria-live="polite">
+          {networkCost.status === "idle" && (
+            <p className="network-cost-line muted">{networkCost.detail || "Network fees"}</p>
+          )}
+          {networkCost.status === "loading" && (
+            <p className="network-cost-line">Network fees — estimating…</p>
+          )}
+          {networkCost.status === "error" && (
+            <p className="network-cost-line bad">Network fees — {networkCost.detail}</p>
+          )}
+          {networkCost.status === "ok" && (
+            <>
+              <p className="network-cost-line">
+                Network fees ≈{" "}
+                <strong>{networkCost.networkFeeSats?.toLocaleString() ?? "?"} sats</strong>
+                <span className="muted">
+                  {" "}
+                  (reveal {networkCost.revealFeeSats?.toLocaleString() ?? "?"}
+                  {networkCost.commitFeeSats != null
+                    ? ` + commit ≈ ${networkCost.commitFeeSats.toLocaleString()}`
+                    : ""}
+                  )
+                </span>
+              </p>
+              <p className="network-cost-line muted">
+                Postage {networkCost.postageSats?.toLocaleString() ?? "?"} sats — returned with the
+                inscription (not a miner fee). Fund commit with{" "}
+                {networkCost.fundCommitSats?.toLocaleString() ?? "?"} sats.
+              </p>
+            </>
+          )}
+        </div>
+
+        <div className="custody-panel">
+          <h3 className="custody-heading">Self Custody</h3>
+          <p>
+            Inscription tapscript is generated using your wallet&apos;s public key. This has added
+            benefits.
+          </p>
+          <p>Reveal transaction is signed with your public key, adding another layer of provenance.</p>
+          <p>You can recover funds from the tapscript address with a key-path spend.</p>
+          <h3 className="custody-heading">Atomic</h3>
+          <p>
+            Fast mode uses Bitcoin&apos;s{" "}
+            <a
+              href="https://bitcoincore.org/en/doc/26.0.0/rpc/rawtransactions/submitpackage/"
+              target="_blank"
+              rel="noreferrer"
+            >
+              submitpackage
+            </a>{" "}
+            (local node) so commit and reveal broadcast in tandem — Esplora sequential fallback when
+            RPC is unavailable.
+          </p>
+          <p>Parent inscriptions and rare sats never get stuck in a commit-only state.</p>
         </div>
 
         {signReview && (
@@ -2006,17 +2609,88 @@ export default function App() {
         {flowPhase !== "idle" && (
           <div className={`flow-status ${flowPhase}`}>
             <div className="flow-steps">
-              <span className={flowPhase === "preparing" ? "on" : ["funding", "review", "grinding", "done"].includes(flowPhase) ? "done" : ""}>
+              <span
+                className={
+                  flowPhase === "preparing"
+                    ? "on"
+                    : ["funding", "review", "grinding", "committed", "done"].includes(flowPhase)
+                      ? "done"
+                      : ""
+                }
+              >
                 1 Prepare
               </span>
-              <span className={flowPhase === "funding" || flowPhase === "review" ? "on" : ["grinding", "done"].includes(flowPhase) ? "done" : ""}>
-                2 Review + sign
+              <span
+                className={
+                  flowPhase === "funding" || flowPhase === "review"
+                    ? "on"
+                    : ["grinding", "committed", "done"].includes(flowPhase)
+                      ? "done"
+                      : ""
+                }
+              >
+                {isControlPace ? "2 Commit" : "2 Review + sign"}
               </span>
-              <span className={flowPhase === "grinding" ? "on" : flowPhase === "done" ? "done" : ""}>
-                3 Reveal
+              <span
+                className={
+                  flowPhase === "grinding"
+                    ? "on"
+                    : flowPhase === "committed"
+                      ? "on"
+                      : flowPhase === "done"
+                        ? "done"
+                        : ""
+                }
+              >
+                {isControlPace ? "3 Reveal (when ready)" : "3 Reveal"}
               </span>
             </div>
             {grindNote && <p className="grind-note">{grindNote}</p>}
+            {flowPhase === "committed" && isControlPace && pendingReveal && (
+              <div className="actions" style={{ marginTop: "0.75rem" }}>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy || !address}
+                  onClick={() => void sendRevealFromProfile(pendingReveal)}
+                >
+                  Reveal now
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => redownloadBundle(pendingReveal)}
+                >
+                  Re-download bundle
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => {
+                    refreshInterrupted();
+                    setPage("profile");
+                  }}
+                >
+                  Open Profile
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {resultTx?.commitTxid && !resultTx.revealTxid && isControlPace && (
+          <div className="result-card">
+            <p>
+              <strong>Commit</strong>{" "}
+              <a href={explorerTxUrl(network, resultTx.commitTxid)} target="_blank" rel="noreferrer">
+                {resultTx.commitTxid}
+              </a>
+            </p>
+            <p className="field-help">
+              Reveal deferred — keep the downloaded <code>.phechan.json</code> until you send reveal.
+            </p>
           </div>
         )}
 
@@ -2047,10 +2721,7 @@ export default function App() {
       {out && (
         <pre className={`out ${ok === true ? "ok" : ok === false ? "bad" : ""}`}>{out}</pre>
       )}
-      <p className="health">
-        {health}
-        {mainnetUnlocked ? " · mainnet unlocked (API)" : ""}
-      </p>
+      <p className="health">{health}</p>
     </div>
   );
 }

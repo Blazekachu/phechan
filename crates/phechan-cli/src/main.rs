@@ -32,7 +32,7 @@ RPC (regtest defaults): PHECHAN_RPC_URL PHECHAN_RPC_USER PHECHAN_RPC_PASS
 Ord labels: PHECHAN_ORD_URL (default http://127.0.0.1:80) with utxo list --ord
 Vault state: PHECHAN_VAULT_ROOT (default cwd) → .phechan/vault/state.json
 
-Mainnet broadcast: PHECHAN_ALLOW_MAINNET_BROADCAST=1 + --confirm \"BROADCAST MAINNET\"
+Mainnet: network from --network / wallet (no env unlock gate)
 "
     );
 }

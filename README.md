@@ -40,12 +40,7 @@ Open http://127.0.0.1:5173 (localhost only).
 ## Networks / broadcast
 
 - Build and preview: any network  
-- Broadcast mainnet requires:
-  1. `PHECHAN_ALLOW_MAINNET_BROADCAST=1` on the CLI / local API process
-  2. Disclosure + explicit Sign in the local UI (or `--confirm "BROADCAST MAINNET"` on CLI)
-  3. Passing validation report
-
-Local UI: connect wallet → **Prepare Inscribe** → review steps + inputs/outputs → **Sign & Inscribe** (Xverse then shows the same I/O). Health line shows `mainnet unlocked (API)` when the env gate is open.
+- Broadcast: network comes from the connected wallet (header pill). No env unlock gate.
 
 ### Ord indexer (Verify parent / sat / delegate)
 

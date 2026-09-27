@@ -153,3 +153,64 @@ pub fn find_vout_in_esplora_tx(tx: &Value, address: &str) -> Option<(u32, u64)> 
     }
     None
 }
+
+/// Chain tip `(height, mediantime)` for locktime vanity — no local bitcoind required.
+///
+/// Uses Esplora `/blocks` (recent tips) and takes the median timestamp of up to 11
+/// blocks (Core-style mediantime approximation).
+pub fn tip_for_locktime(network: Network) -> Result<(u32, u32), EsploraError> {
+    let bases = providers(network);
+    if bases.is_empty() {
+        return Err(EsploraError::Message(
+            "no public Esplora for this network — use local bitcoind".into(),
+        ));
+    }
+    let mut last = String::new();
+    for base in bases {
+        let url = format!("{base}/blocks");
+        match agent().get(&url).call() {
+            Ok(resp) => {
+                let status = resp.status();
+                if !(200..300).contains(&status) {
+                    last = format!("{base}/blocks → {status}");
+                    continue;
+                }
+                let blocks: Value = match resp.into_json() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last = format!("{base}/blocks → json {e}");
+                        continue;
+                    }
+                };
+                let Some(arr) = blocks.as_array() else {
+                    last = format!("{base}/blocks → not an array");
+                    continue;
+                };
+                if arr.is_empty() {
+                    last = format!("{base}/blocks → empty");
+                    continue;
+                }
+                let tip_height = arr[0]
+                    .get("height")
+                    .and_then(|h| h.as_u64())
+                    .unwrap_or(0) as u32;
+                let mut times: Vec<u32> = arr
+                    .iter()
+                    .take(11)
+                    .filter_map(|b| b.get("timestamp").and_then(|t| t.as_u64()).map(|t| t as u32))
+                    .collect();
+                if times.is_empty() || tip_height == 0 {
+                    last = format!("{base}/blocks → missing height/timestamp");
+                    continue;
+                }
+                times.sort_unstable();
+                let mediantime = times[times.len() / 2];
+                return Ok((tip_height, mediantime));
+            }
+            Err(e) => last = format!("{base}/blocks → {e}"),
+        }
+    }
+    Err(EsploraError::Http(format!(
+        "all Esplora tip providers failed: {last}"
+    )))
+}
