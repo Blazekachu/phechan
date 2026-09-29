@@ -324,6 +324,15 @@ button.danger:disabled {
   background: color-mix(in srgb, var(--bg1) 88%, black);
 }
 
+.sign-review-global {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 40;
+  margin: 1rem 0;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  border-color: var(--accent);
+}
+
 .sign-review.mainnet {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);

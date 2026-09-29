@@ -124,11 +124,16 @@ export type VerifyResult = {
   contentType?: string;
 };
 
-async function post(path: string, body: Record<string, unknown>): Promise<CliResponse & VerifyResult> {
+async function post(
+  path: string,
+  body: Record<string, unknown>,
+  init?: { signal?: AbortSignal }
+): Promise<CliResponse & VerifyResult> {
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: init?.signal,
   });
   return res.json();
 }
@@ -151,10 +156,12 @@ export const api = {
     }),
   fundCommitPsbt: (plan: InscribePlan & Record<string, unknown>) =>
     post("/api/inscription/fund-psbt", plan) as Promise<FundPsbtResult>,
-  revealInscription: (plan: InscribePlan) =>
-    post("/api/inscription/reveal", plan as unknown as Record<string, unknown>) as Promise<
-      RevealResult
-    >,
+  revealInscription: (plan: InscribePlan, init?: { signal?: AbortSignal }) =>
+    post(
+      "/api/inscription/reveal",
+      plan as unknown as Record<string, unknown>,
+      init
+    ) as Promise<RevealResult>,
   inspectPsbt: (opts: { base64: string; network?: string }) =>
     post("/api/psbt/inspect", opts) as Promise<
       CliResponse & { vin?: string[]; vout?: string[]; fee_sats?: string; unsigned_txid?: string }

@@ -47,6 +47,58 @@ fn dust_for_spk(spk: &bitcoin::Script) -> u64 {
     }
 }
 
+/// When commit was sized for a high reveal budget, lower `--fee-rate` at reveal can return
+/// surplus as change to `--payment-address` / `--change-address` (above dust). Otherwise all
+/// surplus remains miner fee (legacy behaviour).
+fn split_reveal_fee_and_change(
+    commit_value_sats: u64,
+    postage_sats: u64,
+    fee_rate: f64,
+    vsize_no_change: u64,
+    change_spk: Option<&bitcoin::Script>,
+) -> (u64 /* fee */, u64 /* change */) {
+    let surplus = commit_value_sats.saturating_sub(postage_sats);
+    if surplus == 0 {
+        return (0, 0);
+    }
+    let Some(spk) = change_spk else {
+        return (surplus, 0);
+    };
+    let dust = dust_for_spk(spk);
+    let extra_vbytes: u64 = if spk.is_p2tr() {
+        43
+    } else if spk.is_p2wpkh() {
+        31
+    } else if spk.is_p2sh() {
+        32
+    } else {
+        34
+    };
+    let fee_with = fee_from_vsize(vsize_no_change.saturating_add(extra_vbytes), fee_rate).max(1);
+    let change = surplus.saturating_sub(fee_with);
+    if change >= dust {
+        (fee_with, change)
+    } else {
+        (surplus, 0)
+    }
+}
+
+fn parse_reveal_change_address(
+    args: &[String],
+    network: Network,
+) -> Result<Option<Address>, String> {
+    let Some(addr_s) = flag_value(args, "--payment-address")
+        .or_else(|| flag_value(args, "--change-address"))
+    else {
+        return Ok(None);
+    };
+    let addr = Address::from_str(&addr_s)
+        .map_err(|e| e.to_string())?
+        .require_network(network.to_bitcoin())
+        .map_err(|e| e.to_string())?;
+    Ok(Some(addr))
+}
+
 fn funding_input_label(spk: &bitcoin::Script) -> &'static str {
     if spk.is_p2tr() {
         "p2tr"
@@ -288,6 +340,8 @@ fn estimate_reveal_fee_sats(
             child_value: Amount::from_sat(postage_sats),
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
         })
         .map_err(|e| e.to_string())?;
         let mut tx = psbt.unsigned_tx;
@@ -321,6 +375,8 @@ fn estimate_reveal_fee_sats(
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: op_return.map(|d| d.to_vec()),
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
         })
         .map_err(|e| e.to_string())?;
 
@@ -1170,6 +1226,8 @@ fn run_single_reveal(
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: parse_op_return(args)?,
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
         })
         .map_err(|e| e.to_string())?;
 
@@ -1307,14 +1365,35 @@ fn run_single_reveal(
             "funded commit {value_sats} sats < postage {postage_sats}"
         ));
     }
-    let actual_fee = value_sats - postage_sats;
+    let change_addr = parse_reveal_change_address(args, network)?;
+    let fee_rate_live = parse_fee_rate(args)?.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
+    let (_fee_est, vsize_no_change) = estimate_reveal_fee_sats(
+        &commit,
+        keystore.as_ref(),
+        postage_sats,
+        fee_rate_live,
+        parse_op_return(args)?.as_deref(),
+        false,
+    )?;
+    let change_spk = change_addr.as_ref().map(|a| a.script_pubkey());
+    let (actual_fee, change_sats) = split_reveal_fee_and_change(
+        value_sats,
+        postage_sats,
+        fee_rate_live,
+        vsize_no_change,
+        change_spk.as_ref().map(|s| s.as_script()),
+    );
     let commit_txid_parsed = Txid::from_str(&commit_txid).map_err(|e| e.to_string())?;
     let commit_value = Amount::from_sat(value_sats);
     let dest_value = Amount::from_sat(postage_sats);
 
     println!("funded_commit_sats: {value_sats}");
     println!("postage_sats: {postage_sats}");
-    println!("reveal_fee_sats: {actual_fee} (planned {fee_sats})");
+    println!("reveal_fee_sats: {actual_fee} (planned {fee_sats}; rate {fee_rate_live} sat/vB)");
+    if change_sats > 0 {
+        let chg = change_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
+        println!("reveal_change_sats: {change_sats} → {chg}");
+    }
     println!("destination: {dest_addr_str}");
 
     // Real parent-child FI/FO: spend parent as vin0. Tag-only --parent is refused
@@ -1365,6 +1444,8 @@ fn run_single_reveal(
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
         op_return: parse_op_return(args)?,
+        change_script_pubkey: if change_sats > 0 { change_spk.clone() } else { None },
+        change_value: Amount::from_sat(change_sats),
     })
     .map_err(|e| e.to_string())?;
 
@@ -1488,6 +1569,7 @@ fn run_single_reveal(
 /// - vin1 = commit (keystore script-path if automation key; else wallet signs too)
 /// - vout0 = vault — parent sat returns here (same value as parent input)
 /// - vout1 = child destination — new inscription postage
+/// - vout2 = optional change to payment address when commit surplus > fee at `--fee-rate`
 ///
 /// Returns a PSBT; wallet must sign remaining inputs, then finalize / broadcast.
 fn reveal_parent_child_wallet(
@@ -1579,7 +1661,25 @@ fn reveal_parent_child_wallet(
         );
     }
 
-    let fee_sats = commit_value_sats.saturating_sub(postage_sats);
+    let change_addr = parse_reveal_change_address(args, network)?;
+    let fee_rate = parse_fee_rate(args)?.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
+    // Measure base parent-child vsize (no change), then optionally peel surplus to payment addr.
+    let (_fee_est, vsize_no_change) = estimate_reveal_fee_sats(
+        commit,
+        keystore,
+        postage_sats,
+        fee_rate,
+        None,
+        true,
+    )?;
+    let change_spk = change_addr.as_ref().map(|a| a.script_pubkey());
+    let (fee_sats, change_sats) = split_reveal_fee_and_change(
+        commit_value_sats,
+        postage_sats,
+        fee_rate,
+        vsize_no_change,
+        change_spk.as_ref().map(|s| s.as_script()),
+    );
     let child_value = Amount::from_sat(postage_sats);
     if child_value.to_sat() < P2TR_DUST_SATS {
         return Err(format!(
@@ -1587,13 +1687,17 @@ fn reveal_parent_child_wallet(
         ));
     }
 
+    let mut out_vals = vec![parent_value_sats, postage_sats];
+    if change_sats > 0 {
+        out_vals.push(change_sats);
+    }
     let live_layout = validate_parent_child_layout(ParentChildValidationInput {
         policy: ParentPlacementPolicy::FirstInFirstOut,
         parent_input_index: 0,
         parent_sat_offset: 0,
         vault_vout: 0,
         input_values: &[parent_value_sats, commit_value_sats],
-        output_values: &[parent_value_sats, postage_sats],
+        output_values: &out_vals,
         labeled_inputs: &[LabeledUtxo {
             txid_hex: parent_txid_s.clone(),
             vout: parent_vout,
@@ -1634,6 +1738,12 @@ fn reveal_parent_child_wallet(
         child_value,
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
+        change_script_pubkey: if change_sats > 0 {
+            change_spk.clone()
+        } else {
+            None
+        },
+        change_value: Amount::from_sat(change_sats),
     })
     .map_err(|e| e.to_string())?;
 
@@ -1687,6 +1797,20 @@ fn reveal_parent_child_wallet(
         "child_lands: vout1 {dest_addr_str} ({postage_sats} sats postage) — new child inscription"
     );
     println!("reveal_fee_sats: {fee_sats}");
+    if change_sats > 0 {
+        let chg_addr = change_addr
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        println!(
+            "reveal_change_sats: {change_sats} → vout2 {chg_addr} (surplus after {fee_rate} sat/vB)"
+        );
+        println!("disclosure: over-funded commit surplus returned as change; inscribed sat stays on child postage");
+    } else {
+        println!(
+            "note: no reveal change — surplus stays miner fee (need --payment-address and surplus ≥ dust above fee)"
+        );
+    }
     println!("commit_txid: {commit_txid_s}");
     println!("placement: FirstInFirstOut");
     if keystore.is_some() {
@@ -1947,6 +2071,8 @@ fn child(args: &[String]) -> Result<(), String> {
         child_value,
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
+    change_script_pubkey: None,
+    change_value: Amount::ZERO,
     })
     .map_err(|e| e.to_string())?;
 
@@ -2104,6 +2230,8 @@ fn recover_reveal(args: &[String]) -> Result<(), String> {
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
         op_return: parse_op_return(args)?,
+    change_script_pubkey: None,
+    change_value: Amount::ZERO,
     })
     .map_err(|e| e.to_string())?;
 

@@ -164,13 +164,43 @@ fn witness_from_tap_key_sig(input: &bitcoin::psbt::Input) -> Option<Witness> {
     Some(Witness::p2tr_key_spend(sig))
 }
 
+/// Build a Taproot **script-path** witness from `tap_script_sigs` + `tap_scripts`.
+///
+/// Wallets may leave script-path reveals unfinalized (sig map only). Prefer this
+/// over `tap_key_sig` whenever `tap_scripts` is present — key-path on a commit
+/// leaf (often NUMS internal key) yields `Invalid Schnorr signature` at broadcast.
+fn witness_from_tap_script_sigs(input: &bitcoin::psbt::Input) -> Option<Witness> {
+    let (control_block, (script, leaf_version)) = input.tap_scripts.iter().next()?;
+    if *leaf_version != LeafVersion::TapScript {
+        return None;
+    }
+    let leaf_hash = script.tapscript_leaf_hash();
+    let sig = input
+        .tap_script_sigs
+        .iter()
+        .find(|((_, lh), _)| *lh == leaf_hash)
+        .map(|(_, s)| s)
+        .or_else(|| input.tap_script_sigs.values().next())?;
+    let mut wit = Witness::new();
+    wit.push(sig.to_vec());
+    wit.push(script.as_bytes());
+    wit.push(control_block.serialize());
+    Some(wit)
+}
+
+fn witness_looks_like_key_path(w: &Witness) -> bool {
+    // Key-path: <sig> or <sig> <annex>. Script-path: <sig> <script> <control>.
+    w.len() <= 2
+}
+
 /// Extract a finalized transaction from a PSBT.
 ///
 /// Copies `final_script_sig` + `final_script_witness`. If the wallet left only
 /// `partial_sigs` (Xverse), builds the P2WPKH witness — same role as bitcoinjs
 /// `finalizeAllInputs`. For nested P2SH-P2WPKH, synthesizes the BIP-141 redeem
 /// push from `redeem_script` when `final_script_sig` is empty. Also finalizes
-/// Taproot key-path spends from `tap_key_sig` (parent input of parent-child reveal).
+/// Taproot key-path spends from `tap_key_sig` (parent input of parent-child reveal)
+/// and script-path from `tap_script_sigs` (commit input).
 pub fn finalize_to_tx(psbt: &Psbt) -> Result<Transaction, PsbtBuildError> {
     use bitcoin::script::{Builder, PushBytesBuf};
 
@@ -199,17 +229,27 @@ pub fn finalize_to_tx(psbt: &Psbt) -> Result<Transaction, PsbtBuildError> {
             }
         }
 
+        let has_tap_scripts = !input.tap_scripts.is_empty();
         let witness = match &input.final_script_witness {
-            Some(w) if !w.is_empty() => Some(w.clone()),
+            // Wallet sometimes attaches a 1-stack key-path witness on a script-path
+            // commit input — reject that and rebuild from tap_script_sigs.
+            Some(w)
+                if !w.is_empty()
+                    && !(has_tap_scripts && witness_looks_like_key_path(w)) =>
+            {
+                Some(w.clone())
+            }
+            _ if has_tap_scripts => witness_from_tap_script_sigs(input)
+                .or_else(|| witness_from_partial_sigs(input)),
             _ => witness_from_partial_sigs(input).or_else(|| witness_from_tap_key_sig(input)),
         };
 
         if let Some(witness) = witness {
             tx.input[i].witness = witness;
         } else if tx.input[i].script_sig.is_empty() {
-              return Err(PsbtBuildError::Message(format!(
-                "input {i} not finalized (missing final_script_witness / tap_key_sig / partial_sigs / final_script_sig)"
-              )));
+            return Err(PsbtBuildError::Message(format!(
+                "input {i} not finalized (missing final_script_witness / tap_script_sigs / tap_key_sig / partial_sigs / final_script_sig)"
+            )));
         }
 
         // Segwit spends need a non-empty witness (nested P2SH-P2WPKH included).
@@ -306,6 +346,8 @@ mod tests {
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: None,
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
         })
         .unwrap();
 

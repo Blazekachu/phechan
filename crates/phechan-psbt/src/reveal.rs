@@ -17,11 +17,14 @@ pub struct RevealPsbtParams {
     pub destination_value: Amount,
     pub leaf_script: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
-    /// Optional OP_RETURN payload (reveal vout1). Max 80 bytes for standard relay.
+    /// Optional OP_RETURN payload (after dest [+ change]). Max 80 bytes for standard relay.
     pub op_return: Option<Vec<u8>>,
+    /// Optional change back to payment address when commit was over-funded for reveal fee.
+    pub change_script_pubkey: Option<ScriptBuf>,
+    pub change_value: Amount,
 }
 
-/// Parent+child reveal: input0=parent, input1=commit; out0=vault (parent return), out1=child dest.
+/// Parent+child reveal: input0=parent, input1=commit; out0=vault, out1=child [, out2=change].
 pub struct ParentChildRevealParams {
     pub parent_txid: Txid,
     pub parent_vout: u32,
@@ -39,14 +42,26 @@ pub struct ParentChildRevealParams {
     pub child_value: Amount,
     pub leaf_script: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
+    /// Optional change (vout2) — surplus commit sats after postage + miner fee.
+    pub change_script_pubkey: Option<ScriptBuf>,
+    pub change_value: Amount,
 }
 
-/// Build unsigned reveal PSBT: spend commit via tapscript to destination [+ optional OP_RETURN].
+/// Build unsigned reveal PSBT: spend commit via tapscript to destination [+ change] [+ OP_RETURN].
 pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildError> {
     let mut outputs = vec![TxOut {
         value: params.destination_value,
         script_pubkey: params.destination_script_pubkey,
     }];
+    if params.change_value.to_sat() > 0 {
+        let spk = params.change_script_pubkey.ok_or_else(|| {
+            PsbtBuildError::Message("change_value set but change_script_pubkey missing".into())
+        })?;
+        outputs.push(TxOut {
+            value: params.change_value,
+            script_pubkey: spk,
+        });
+    }
     if let Some(data) = params.op_return {
         if data.len() > 80 {
             return Err(PsbtBuildError::Message(
@@ -106,6 +121,26 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
 pub fn build_parent_child_reveal_psbt(
     params: ParentChildRevealParams,
 ) -> Result<Psbt, PsbtBuildError> {
+    let mut outputs = vec![
+        TxOut {
+            value: params.vault_value,
+            script_pubkey: params.vault_script_pubkey,
+        },
+        TxOut {
+            value: params.child_value,
+            script_pubkey: params.child_script_pubkey,
+        },
+    ];
+    if params.change_value.to_sat() > 0 {
+        let spk = params.change_script_pubkey.ok_or_else(|| {
+            PsbtBuildError::Message("change_value set but change_script_pubkey missing".into())
+        })?;
+        outputs.push(TxOut {
+            value: params.change_value,
+            script_pubkey: spk,
+        });
+    }
+
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -129,16 +164,7 @@ pub fn build_parent_child_reveal_psbt(
                 witness: bitcoin::Witness::new(),
             },
         ],
-        output: vec![
-            TxOut {
-                value: params.vault_value,
-                script_pubkey: params.vault_script_pubkey,
-            },
-            TxOut {
-                value: params.child_value,
-                script_pubkey: params.child_script_pubkey,
-            },
-        ],
+        output: outputs,
     };
 
     let mut psbt = Psbt::from_unsigned_tx(tx)
@@ -173,4 +199,53 @@ pub fn build_parent_child_reveal_psbt(
     psbt.inputs[1] = commit_in;
 
     Ok(psbt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use bitcoin::key::Keypair;
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::taproot::TaprootBuilder;
+    use bitcoin::XOnlyPublicKey;
+
+    fn mock_commit() -> (ScriptBuf, TaprootSpendInfo, ScriptBuf) {
+        let secp = Secp256k1::new();
+        let kp = Keypair::from_seckey_slice(&secp, &[2u8; 32]).unwrap();
+        let (xonly, _parity) = XOnlyPublicKey::from_keypair(&kp);
+        let leaf = ScriptBuf::new_op_return(b"x");
+        let builder = TaprootBuilder::new().add_leaf(0, leaf.clone()).unwrap();
+        let spend = builder.finalize(&secp, xonly).unwrap();
+        let spk = ScriptBuf::new_p2tr(&secp, spend.internal_key(), spend.merkle_root());
+        (spk, spend, leaf)
+    }
+
+    #[test]
+    fn parent_child_change_adds_vout2() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = build_parent_child_reveal_psbt(ParentChildRevealParams {
+            parent_txid: Txid::from_byte_array([1u8; 32]),
+            parent_vout: 0,
+            parent_value: Amount::from_sat(546),
+            parent_script_pubkey: dest.clone(),
+            parent_tap_internal_key: Some(spend.internal_key()),
+            commit_txid: Txid::from_byte_array([2u8; 32]),
+            commit_vout: 0,
+            commit_value: Amount::from_sat(10_000),
+            commit_script_pubkey: commit_spk,
+            vault_script_pubkey: dest.clone(),
+            vault_value: Amount::from_sat(546),
+            child_script_pubkey: dest.clone(),
+            child_value: Amount::from_sat(546),
+            leaf_script: leaf,
+            spend_info: spend,
+            change_script_pubkey: Some(dest),
+            change_value: Amount::from_sat(8_000),
+        })
+        .unwrap();
+        assert_eq!(psbt.unsigned_tx.output.len(), 3);
+        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 8_000);
+    }
 }

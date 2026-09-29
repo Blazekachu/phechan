@@ -148,6 +148,8 @@ function fileToBase64(file: File): Promise<string> {
 export default function App() {
   const [health, setHealth] = useState("checking…");
   const [busy, setBusy] = useState(false);
+  const revealAbortRef = useRef<AbortController | null>(null);
+  const [revealingCommitTxid, setRevealingCommitTxid] = useState<string | null>(null);
   const [out, setOut] = useState("");
   const [ok, setOk] = useState<boolean | null>(null);
 
@@ -615,7 +617,7 @@ export default function App() {
       commitTxid: string,
       expectedCommitAddress: string | undefined,
       planOverride?: InscribePlan,
-      opts?: { commitHexForPackage?: string }
+      opts?: { commitHexForPackage?: string; signal?: AbortSignal }
     ) => {
       const activePlan = planOverride || plan;
       const sameSat = Boolean(activePlan.sameSatParent);
@@ -670,7 +672,7 @@ export default function App() {
       );
       setFlowPhase("grinding");
       const grindMsg = hasRevealVanity
-        ? `Grinding reveal TXID ${activePlan.vanityPrefix || ""}…${activePlan.vanitySuffix || ""}`
+        ? `Grinding reveal TXID ${activePlan.vanityPrefix || ""}…${activePlan.vanitySuffix || ""} — wait (can take ~1 min). Do not click again.`
         : atomicPackage
           ? "Building reveal for atomic package…"
           : "Building & broadcasting reveal…";
@@ -683,18 +685,24 @@ export default function App() {
 
       let rev: Awaited<ReturnType<typeof api.revealInscription>> | null = null;
       for (let attempt = 0; attempt < 5; attempt++) {
-        rev = await api.revealInscription({
-          ...activePlan,
-          commitTxid,
-          destination: activePlan.destination || address,
-          parentOutpoint: sameSat ? undefined : activePlan.parentOutpoint,
-          parentValue: sameSat ? undefined : activePlan.parentValue,
-          parentAddress: activePlan.parentAddress || address,
-          vaultAddress: activePlan.vaultAddress || address,
-          ordinalsPublicKey:
-            activePlan.ordinalsPublicKey || ordinalsPublicKey || undefined,
-          sameSatParent: sameSat || undefined,
-        });
+        if (opts?.signal?.aborted) {
+          throw new Error("Reveal cancelled.");
+        }
+        rev = await api.revealInscription(
+          {
+            ...activePlan,
+            commitTxid,
+            destination: activePlan.destination || address,
+            parentOutpoint: sameSat ? undefined : activePlan.parentOutpoint,
+            parentValue: sameSat ? undefined : activePlan.parentValue,
+            parentAddress: activePlan.parentAddress || address,
+            vaultAddress: activePlan.vaultAddress || address,
+            ordinalsPublicKey:
+              activePlan.ordinalsPublicKey || ordinalsPublicKey || undefined,
+            sameSatParent: sameSat || undefined,
+          },
+          { signal: opts?.signal }
+        );
         if (!rev.error) break;
         const err = String(rev.error);
         if (attempt < 4 && isTransientError(err)) {
@@ -1351,6 +1359,7 @@ export default function App() {
         ordinalsPublicKey: ordinalsPublicKey || undefined,
         sameSatParent: sameSatParent || undefined,
         commitTxid,
+        commitVout: 0,
         commitValue: commitSats,
       });
       const interruptedItem: InterruptedCommit = {
@@ -1467,33 +1476,119 @@ export default function App() {
     requestSignReview,
   ]);
 
+  /** Reveal-only overrides on a deferred commit (commit already funded — vanity/fee safe to change). */
+  function patchInterruptedReveal(
+    commitTxid: string,
+    patch: Partial<Pick<InscribePlan, "vanityPrefix" | "vanitySuffix" | "revealFeeRate" | "feeRate">>
+  ) {
+    const cur = listInterruptedCommits().find((x) => x.commitTxid === commitTxid);
+    if (!cur) return;
+    const nextPlan: InscribePlan = { ...cur.plan, ...patch };
+    if ("vanityPrefix" in patch && !patch.vanityPrefix) delete nextPlan.vanityPrefix;
+    if ("vanitySuffix" in patch && !patch.vanitySuffix) delete nextPlan.vanitySuffix;
+    upsertInterruptedCommit({
+      ...cur,
+      plan: snapshotPlan(nextPlan),
+    });
+    refreshInterrupted();
+    if (pendingReveal?.commitTxid === commitTxid) {
+      setPendingReveal({
+        ...cur,
+        plan: snapshotPlan(nextPlan),
+        savedAt: Date.now(),
+      });
+    }
+  }
+
+  function cancelReveal() {
+    revealAbortRef.current?.abort();
+    revealAbortRef.current = null;
+    if (signReviewResolver.current) {
+      const resolve = signReviewResolver.current;
+      signReviewResolver.current = null;
+      resolve(false);
+    }
+    setSignReview(null);
+    setBusy(false);
+    setRevealingCommitTxid(null);
+    setGrindNote("");
+    setFlowPhase("error");
+    setOut("Reveal cancelled. Commit is still funded — edit vanity if needed, then Send reveal again.");
+  }
+
   async function sendRevealFromProfile(item: InterruptedCommit) {
     if (!address) {
       setOk(false);
       setOut("Connect wallet first");
       return;
     }
+    if (busy) {
+      setOut(
+        grindNote ||
+          "Reveal already in progress — wait for grind / wallet sign, or Cancel."
+      );
+      return;
+    }
+    // Clear any stuck prior sign-review waiter (e.g. Profile hang before modal was global).
+    if (signReviewResolver.current) {
+      const resolve = signReviewResolver.current;
+      signReviewResolver.current = null;
+      resolve(false);
+      setSignReview(null);
+    }
+    // Re-read so Profile fee/vanity edits apply even if list row is stale.
+    const latest =
+      listInterruptedCommits().find((x) => x.commitTxid === item.commitTxid) || item;
+    revealAbortRef.current?.abort();
+    const ac = new AbortController();
+    revealAbortRef.current = ac;
     setBusy(true);
     setOk(null);
-    setPage("inscribe");
-    setPendingReveal(item);
+    setRevealingCommitTxid(latest.commitTxid);
+    // Stay on Profile — sign-review panel is now global (was Inscribe-only; that blocked popup).
+    setPage("profile");
+    setPendingReveal(latest);
     try {
       const p: InscribePlan = {
-        ...item.plan,
+        ...latest.plan,
         destination: address,
         vaultAddress: address,
-        ordinalsPublicKey: ordinalsPublicKey || item.plan.ordinalsPublicKey,
+        ordinalsPublicKey: ordinalsPublicKey || latest.plan.ordinalsPublicKey,
+        // Needed so surplus at lower reveal fee returns as change (vout2).
+        paymentAddress:
+          latest.plan.paymentAddress || paymentAddress || undefined,
+        // Avoid slow commit tx lookup when we already know the funded outpoint.
+        commitVout: latest.plan.commitVout ?? 0,
+        commitValue: latest.plan.commitValue,
       };
-      await runRevealFromCommit(item.commitTxid, item.commitAddress, p);
+      // Persist cleared vanity / fee edits + commitVout for next attempt
+      upsertInterruptedCommit({
+        ...latest,
+        plan: snapshotPlan(p),
+      });
+      await runRevealFromCommit(latest.commitTxid, latest.commitAddress, p, {
+        signal: ac.signal,
+      });
       setPendingReveal(null);
     } catch (e) {
-      setFlowPhase("error");
-      setOk(false);
-      setOut(String(e));
+      const msg = String(e);
+      if (ac.signal.aborted || /cancelled|abort/i.test(msg)) {
+        setFlowPhase("error");
+        setOk(false);
+        setOut(
+          "Reveal cancelled. Commit is still funded — Clear vanity for a fast finish, then Send reveal."
+        );
+      } else {
+        setFlowPhase("error");
+        setOk(false);
+        setOut(msg);
+      }
       setPage("profile");
       refreshInterrupted();
     } finally {
+      if (revealAbortRef.current === ac) revealAbortRef.current = null;
       setBusy(false);
+      setRevealingCommitTxid(null);
       setGrindNote("");
     }
   }
@@ -1750,8 +1845,8 @@ export default function App() {
           <h2>Profile — deferred commits</h2>
           <p className="field-help">
             {isControlPace
-              ? "Control mode downloads a .phechan.json after commit. Keep it safe, then Send reveal here (or Upload bundle). Works on whatever network your wallet is connected to."
-              : "Fast mode finishes reveal in one session. This list is crash recovery if reveal failed after commit — Send reveal finishes without funding again. Switch Inscribe → Control for deferred reveal + bundles."}
+              ? "Control mode downloads a .phechan.json after commit. Keep it safe, then Send reveal here (or Upload bundle). You can change reveal fee / vanity on each row — commit is already funded."
+              : "Fast mode finishes reveal in one session. This list is crash recovery if reveal failed after commit — edit reveal fee/vanity if needed, then Send reveal. Switch Inscribe → Control for deferred reveal + bundles."}
           </p>
           <div className="verify-row" style={{ marginBottom: "1rem" }}>
             <input
@@ -1774,7 +1869,13 @@ export default function App() {
             <p className="muted">No deferred commits. Inscribe → commit, or upload a bundle.</p>
           ) : (
             <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-              {interrupted.map((item) => (
+              {interrupted.map((item) => {
+                const vPre = item.plan.vanityPrefix || "";
+                const vSuf = item.plan.vanitySuffix || "";
+                const revealFee =
+                  item.plan.revealFeeRate ?? item.plan.feeRate ?? 1;
+                const vanityEst = estimateVanity(vPre, vSuf);
+                return (
                 <li
                   key={item.commitTxid}
                   style={{
@@ -1795,19 +1896,128 @@ export default function App() {
                         ? " · parent-child FI/FO"
                         : ""}
                     {item.plan.parentId ? ` · parent ${item.plan.parentId}` : ""}
-                    {item.plan.revealFeeRate != null || item.plan.feeRate != null
-                      ? ` · reveal budget ~${item.plan.revealFeeRate ?? item.plan.feeRate} sat/vB`
-                      : ""}
                   </p>
+                    <p className="field-help" style={{ margin: "0.25rem 0 0.5rem" }}>
+                      Commit is already funded — edit <strong>reveal fee / vanity</strong> below, then
+                      Send reveal. Lowering fee below the funded budget returns surplus as{" "}
+                      <strong>change to your payment address</strong> (vout2 on parent-child). Postage
+                      stays on the child; parent returns to vault.
+                    </p>
+                  {signReview ? (
+                    <p className="field-help" style={{ color: "var(--accent, #f97316)", margin: "0.35rem 0" }}>
+                      Sign review is ready below — click <strong>{signReview.buttonLabel}</strong>, then
+                      approve the wallet popup (parent + commit inputs).
+                    </p>
+                  ) : revealingCommitTxid === item.commitTxid ? (
+                    <p className="field-help" style={{ color: "var(--accent, #f97316)", margin: "0.35rem 0" }}>
+                      {grindNote || "Building parent-child reveal PSBT…"} — wallet popup comes after
+                      you approve the sign-review panel.
+                    </p>
+                  ) : null}
+                  <div className="row two" style={{ marginBottom: "0.5rem" }}>
+                    <div>
+                      <label htmlFor={`rev-fee-${item.commitTxid.slice(0, 8)}`}>
+                        Reveal fee (sat/vB) — info only after fund
+                      </label>
+                      <input
+                        id={`rev-fee-${item.commitTxid.slice(0, 8)}`}
+                        type="number"
+                        min={0.1}
+                        step="any"
+                        disabled={busy}
+                        value={revealFee}
+                        onChange={(e) => {
+                          const n = parseFeeRateInput(e.target.value, 1);
+                          patchInterruptedReveal(item.commitTxid, {
+                            revealFeeRate: n,
+                            feeRate: n,
+                          });
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label>Reveal vanity</label>
+                      <div className="verify-row" style={{ gap: "0.35rem" }}>
+                        <input
+                          aria-label="Reveal vanity prefix"
+                          placeholder="prefix"
+                          spellCheck={false}
+                          disabled={busy}
+                          value={vPre}
+                          style={{ flex: 1, minWidth: 0 }}
+                          onChange={(e) =>
+                            patchInterruptedReveal(item.commitTxid, {
+                              vanityPrefix: sanitizeVanityHex(
+                                e.target.value,
+                                MAX_VANITY_TOTAL - vSuf.length
+                              ),
+                            })
+                          }
+                        />
+                        <span className="muted">…</span>
+                        <input
+                          aria-label="Reveal vanity suffix"
+                          placeholder="suffix"
+                          spellCheck={false}
+                          disabled={busy}
+                          value={vSuf}
+                          style={{ flex: 1, minWidth: 0 }}
+                          onChange={(e) =>
+                            patchInterruptedReveal(item.commitTxid, {
+                              vanitySuffix: sanitizeVanityHex(
+                                e.target.value,
+                                MAX_VANITY_TOTAL - vPre.length
+                              ),
+                            })
+                          }
+                        />
+                        <button
+                          type="button"
+                          className="ghost"
+                          disabled={busy || (!vPre && !vSuf)}
+                          title="Clear reveal vanity"
+                          onClick={() =>
+                            patchInterruptedReveal(item.commitTxid, {
+                              vanityPrefix: "",
+                              vanitySuffix: "",
+                            })
+                          }
+                        >
+                          Clear
+                        </button>
+                      </div>
+                      {(vPre || vSuf) && (
+                        <p className="field-help" style={{ margin: "0.25rem 0 0" }}>
+                          {vPre}…{vSuf} · {vanityEst.description} · ETA {vanityEst.eta}
+                          {vPre.length + vSuf.length >= 6
+                            ? " — 6 chars often fails (5M try cap); clear or use ≤3"
+                            : ""}
+                        </p>
+                      )}
+                    </div>
+                  </div>
                   <div className="verify-row">
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={busy || !address}
-                      onClick={() => void sendRevealFromProfile(item)}
-                    >
-                      Send reveal
-                    </button>
+                    {revealingCommitTxid === item.commitTxid ? (
+                      <button type="button" className="ghost" onClick={cancelReveal}>
+                        Cancel grind
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={busy || !address}
+                        title={
+                          !address
+                            ? "Connect wallet first"
+                            : busy
+                              ? "Another reveal is in progress"
+                              : "Build reveal PSBT (grinds vanity first if set)"
+                        }
+                        onClick={() => void sendRevealFromProfile(item)}
+                      >
+                        Send reveal
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="ghost"
@@ -1841,7 +2051,8 @@ export default function App() {
                     </a>
                   </div>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </section>
@@ -2521,75 +2732,6 @@ export default function App() {
           <p>Parent inscriptions and rare sats never get stuck in a commit-only state.</p>
         </div>
 
-        {signReview && (
-          <div className={`sign-review${isMainnetNet ? " mainnet" : ""}`}>
-            <h3>{signReview.headline}</h3>
-            <ul className="sign-review-steps">
-              {signReview.steps.map((s) => (
-                <li key={s}>{s}</li>
-              ))}
-            </ul>
-            {signReview.warnings.length > 0 && (
-              <ul className="sign-review-warn">
-                {signReview.warnings.map((w) => (
-                  <li key={w}>{w}</li>
-                ))}
-              </ul>
-            )}
-            <div className="sign-review-io">
-              <div>
-                <h4>Inputs</h4>
-                {signReview.inputs.length ? (
-                  <ul>
-                    {signReview.inputs.map((line, i) => (
-                      <li key={`in-${i}`} className="mono">
-                        {line}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">Wallet will show inputs.</p>
-                )}
-              </div>
-              <div>
-                <h4>Outputs</h4>
-                {signReview.outputs.length ? (
-                  <ul>
-                    {signReview.outputs.map((line, i) => (
-                      <li key={`out-${i}`} className="mono">
-                        {line}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">Wallet will show outputs.</p>
-                )}
-              </div>
-            </div>
-            {signReview.meta.length > 0 && (
-              <p className="muted mono">{signReview.meta.join(" · ")}</p>
-            )}
-            <div className="actions">
-              <button
-                type="button"
-                className="primary"
-                disabled={busy}
-                onClick={approveSignReview}
-              >
-                {signReview.buttonLabel}
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy}
-                onClick={cancelSignReview}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-
         {showPreview && contentPreview && (
           <div className="content-preview">
             <p className="field-help">Content preview (how the payload renders — not a PSBT).</p>
@@ -2717,6 +2859,74 @@ export default function App() {
         )}
       </section>
       ) : null}
+
+      {signReview && (
+        <div className={`sign-review sign-review-global${isMainnetNet ? " mainnet" : ""}`}>
+          <h3>{signReview.headline}</h3>
+          <p className="field-help" style={{ marginTop: 0 }}>
+            Parent-child reveal needs your wallet to sign after you approve here — this panel shows
+            on Profile and Inscribe.
+          </p>
+          <ul className="sign-review-steps">
+            {signReview.steps.map((s) => (
+              <li key={s}>{s}</li>
+            ))}
+          </ul>
+          {signReview.warnings.length > 0 && (
+            <ul className="sign-review-warn">
+              {signReview.warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          )}
+          <div className="sign-review-io">
+            <div>
+              <h4>Inputs</h4>
+              {signReview.inputs.length ? (
+                <ul>
+                  {signReview.inputs.map((line, i) => (
+                    <li key={`in-${i}`} className="mono">
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">Wallet will show inputs.</p>
+              )}
+            </div>
+            <div>
+              <h4>Outputs</h4>
+              {signReview.outputs.length ? (
+                <ul>
+                  {signReview.outputs.map((line, i) => (
+                    <li key={`out-${i}`} className="mono">
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">Wallet will show outputs.</p>
+              )}
+            </div>
+          </div>
+          {signReview.meta.length > 0 && (
+            <p className="muted mono">{signReview.meta.join(" · ")}</p>
+          )}
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              disabled={busy}
+              onClick={approveSignReview}
+            >
+              {signReview.buttonLabel}
+            </button>
+            <button type="button" className="ghost" disabled={busy} onClick={cancelSignReview}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {out && (
         <pre className={`out ${ok === true ? "ok" : ok === false ? "bad" : ""}`}>{out}</pre>
