@@ -41,7 +41,10 @@ export function createCommitBundle(params: {
     ...(params.commitSats != null && params.commitSats > 0
       ? { commitSats: params.commitSats }
       : {}),
-    plan: snapshotPlan(params.plan),
+    plan: snapshotPlan({
+      ...params.plan,
+      network: params.network,
+    }),
   };
 }
 
@@ -75,6 +78,8 @@ export function interruptedFromBundle(bundle: CommitBundle): InterruptedCommit {
     savedAt: Date.now(),
     plan: snapshotPlan({
       ...bundle.plan,
+      // Bundle top-level network is authoritative (reveal/vanity tip/broadcast).
+      network: bundle.network,
       commitTxid: bundle.commitTxid,
       ...(bundle.commitSats != null
         ? { commitValue: bundle.commitSats }

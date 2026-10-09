@@ -340,8 +340,9 @@ fn estimate_reveal_fee_sats(
             child_value: Amount::from_sat(postage_sats),
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
-        change_script_pubkey: None,
-        change_value: Amount::ZERO,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+            op_return: op_return.map(|d| d.to_vec()),
         })
         .map_err(|e| e.to_string())?;
         let mut tx = psbt.unsigned_tx;
@@ -351,17 +352,6 @@ fn estimate_reveal_fee_sats(
             let mut w = Witness::new();
             w.push([0u8; 64]);
             tx.input[0].witness = w;
-        }
-        // OP_RETURN on reveal (inscribe.dev adds this when enabled) — size matters at low fee rates.
-        if let Some(data) = op_return {
-            if !data.is_empty() && data.len() <= 80 {
-                if let Ok(push) = <&bitcoin::script::PushBytes>::try_from(data) {
-                    tx.output.push(bitcoin::TxOut {
-                        value: Amount::ZERO,
-                        script_pubkey: ScriptBuf::new_op_return(push),
-                    });
-                }
-            }
         }
         vsize_with_dummy_script_path_witness(tx, 1, &commit.leaf_script, &control)
     } else {
@@ -1122,7 +1112,10 @@ fn run_single_reveal(
 
     if let Some(opr) = parse_op_return(args)? {
         let preview = String::from_utf8_lossy(&opr);
-        println!("op_return: {preview} ({} bytes → reveal vout1)", opr.len());
+        println!(
+            "op_return: {preview} ({} bytes → last reveal output)",
+            opr.len()
+        );
     }
     if let Some(vp) = flag_value(args, "--vanity-prefix") {
         println!("vanity_prefix: {vp}");
@@ -1570,6 +1563,7 @@ fn run_single_reveal(
 /// - vout0 = vault — parent sat returns here (same value as parent input)
 /// - vout1 = child destination — new inscription postage
 /// - vout2 = optional change to payment address when commit surplus > fee at `--fee-rate`
+/// - final = optional OP_RETURN (`--op-return`) after child [+ change]
 ///
 /// Returns a PSBT; wallet must sign remaining inputs, then finalize / broadcast.
 fn reveal_parent_child_wallet(
@@ -1663,13 +1657,14 @@ fn reveal_parent_child_wallet(
 
     let change_addr = parse_reveal_change_address(args, network)?;
     let fee_rate = parse_fee_rate(args)?.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
+    let op_return = parse_op_return(args)?;
     // Measure base parent-child vsize (no change), then optionally peel surplus to payment addr.
     let (_fee_est, vsize_no_change) = estimate_reveal_fee_sats(
         commit,
         keystore,
         postage_sats,
         fee_rate,
-        None,
+        op_return.as_deref(),
         true,
     )?;
     let change_spk = change_addr.as_ref().map(|a| a.script_pubkey());
@@ -1744,6 +1739,7 @@ fn reveal_parent_child_wallet(
             None
         },
         change_value: Amount::from_sat(change_sats),
+        op_return,
     })
     .map_err(|e| e.to_string())?;
 
@@ -2071,8 +2067,9 @@ fn child(args: &[String]) -> Result<(), String> {
         child_value,
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
-    change_script_pubkey: None,
-    change_value: Amount::ZERO,
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
+        op_return: parse_op_return(args)?,
     })
     .map_err(|e| e.to_string())?;
 

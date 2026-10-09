@@ -8,6 +8,33 @@ use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 
 use crate::PsbtBuildError;
 
+/// Append optional nulldata last. Empty / None = no-op (preserves legacy layouts).
+fn append_op_return(
+    outputs: &mut Vec<TxOut>,
+    op_return: Option<Vec<u8>>,
+) -> Result<(), PsbtBuildError> {
+    let Some(data) = op_return else {
+        return Ok(());
+    };
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() > 80 {
+        return Err(PsbtBuildError::Message(
+            "OP_RETURN payload exceeds 80-byte standard relay limit".into(),
+        ));
+    }
+    let push: &bitcoin::script::PushBytes = data.as_slice().try_into().map_err(|_| {
+        PsbtBuildError::Message("OP_RETURN payload too large for push".into())
+    })?;
+    outputs.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(push),
+    });
+    Ok(())
+}
+
+#[derive(Clone)]
 pub struct RevealPsbtParams {
     pub commit_txid: Txid,
     pub commit_vout: u32,
@@ -24,7 +51,7 @@ pub struct RevealPsbtParams {
     pub change_value: Amount,
 }
 
-/// Parent+child reveal: input0=parent, input1=commit; out0=vault, out1=child [, out2=change].
+/// Parent+child reveal: input0=parent, input1=commit; out0=vault, out1=child [, change] [, OP_RETURN].
 pub struct ParentChildRevealParams {
     pub parent_txid: Txid,
     pub parent_vout: u32,
@@ -42,9 +69,11 @@ pub struct ParentChildRevealParams {
     pub child_value: Amount,
     pub leaf_script: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
-    /// Optional change (vout2) — surplus commit sats after postage + miner fee.
+    /// Optional change (after child) — surplus commit sats after postage + miner fee.
     pub change_script_pubkey: Option<ScriptBuf>,
     pub change_value: Amount,
+    /// Optional OP_RETURN payload (after vault + child [+ change]). Max 80 bytes for standard relay.
+    pub op_return: Option<Vec<u8>>,
 }
 
 /// Build unsigned reveal PSBT: spend commit via tapscript to destination [+ change] [+ OP_RETURN].
@@ -62,20 +91,7 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
             script_pubkey: spk,
         });
     }
-    if let Some(data) = params.op_return {
-        if data.len() > 80 {
-            return Err(PsbtBuildError::Message(
-                "OP_RETURN payload exceeds 80-byte standard relay limit".into(),
-            ));
-        }
-        let push: &bitcoin::script::PushBytes = data.as_slice().try_into().map_err(|_| {
-            PsbtBuildError::Message("OP_RETURN payload too large for push".into())
-        })?;
-        outputs.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::new_op_return(push),
-        });
-    }
+    append_op_return(&mut outputs, params.op_return)?;
 
     let tx = Transaction {
         version: Version::TWO,
@@ -140,6 +156,7 @@ pub fn build_parent_child_reveal_psbt(
             script_pubkey: spk,
         });
     }
+    append_op_return(&mut outputs, params.op_return)?;
 
     let tx = Transaction {
         version: Version::TWO,
@@ -221,11 +238,19 @@ mod tests {
         (spk, spend, leaf)
     }
 
-    #[test]
-    fn parent_child_change_adds_vout2() {
-        let (commit_spk, spend, leaf) = mock_commit();
-        let dest = commit_spk.clone();
-        let psbt = build_parent_child_reveal_psbt(ParentChildRevealParams {
+    fn parent_child_base(
+        spend: TaprootSpendInfo,
+        leaf: ScriptBuf,
+        commit_spk: ScriptBuf,
+        dest: ScriptBuf,
+        change: Option<(ScriptBuf, u64)>,
+        op_return: Option<Vec<u8>>,
+    ) -> Psbt {
+        let (change_spk, change_value) = match change {
+            Some((spk, v)) => (Some(spk), Amount::from_sat(v)),
+            None => (None, Amount::ZERO),
+        };
+        build_parent_child_reveal_psbt(ParentChildRevealParams {
             parent_txid: Txid::from_byte_array([1u8; 32]),
             parent_vout: 0,
             parent_value: Amount::from_sat(546),
@@ -237,15 +262,151 @@ mod tests {
             commit_script_pubkey: commit_spk,
             vault_script_pubkey: dest.clone(),
             vault_value: Amount::from_sat(546),
-            child_script_pubkey: dest.clone(),
+            child_script_pubkey: dest,
             child_value: Amount::from_sat(546),
             leaf_script: leaf,
             spend_info: spend,
-            change_script_pubkey: Some(dest),
-            change_value: Amount::from_sat(8_000),
+            change_script_pubkey: change_spk,
+            change_value,
+            op_return,
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn parent_child_baseline_no_op_return_is_two_outputs() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = parent_child_base(spend, leaf, commit_spk, dest, None, None);
+        // Legacy regtest / UI layout when --op-return is unset.
+        assert_eq!(psbt.unsigned_tx.output.len(), 2);
+        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 546); // vault
+        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 546); // child
+        assert!(!psbt.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert!(!psbt.unsigned_tx.output[1].script_pubkey.is_op_return());
+    }
+
+    #[test]
+    fn parent_child_empty_op_return_is_noop() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = parent_child_base(spend, leaf, commit_spk, dest, None, Some(vec![]));
+        assert_eq!(psbt.unsigned_tx.output.len(), 2);
+    }
+
+    #[test]
+    fn parent_child_change_adds_vout2() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = parent_child_base(
+            spend,
+            leaf,
+            commit_spk,
+            dest.clone(),
+            Some((dest, 8_000)),
+            None,
+        );
         assert_eq!(psbt.unsigned_tx.output.len(), 3);
         assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 8_000);
+        assert!(!psbt.unsigned_tx.output[2].script_pubkey.is_op_return());
+    }
+
+    #[test]
+    fn parent_child_op_return_after_child_preserves_vault_child() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = parent_child_base(
+            spend,
+            leaf,
+            commit_spk,
+            dest,
+            None,
+            Some(b"phechan".to_vec()),
+        );
+        assert_eq!(psbt.unsigned_tx.output.len(), 3);
+        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 546);
+        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 546);
+        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 0);
+        assert!(psbt.unsigned_tx.output[2].script_pubkey.is_op_return());
+    }
+
+    #[test]
+    fn parent_child_op_return_after_change() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let psbt = parent_child_base(
+            spend,
+            leaf,
+            commit_spk,
+            dest.clone(),
+            Some((dest, 8_000)),
+            Some(b"phechan".to_vec()),
+        );
+        assert_eq!(psbt.unsigned_tx.output.len(), 4);
+        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 8_000);
+        assert_eq!(psbt.unsigned_tx.output[3].value.to_sat(), 0);
+        assert!(psbt.unsigned_tx.output[3].script_pubkey.is_op_return());
+    }
+
+    #[test]
+    fn parent_child_op_return_rejects_over_80() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let err = build_parent_child_reveal_psbt(ParentChildRevealParams {
+            parent_txid: Txid::from_byte_array([1u8; 32]),
+            parent_vout: 0,
+            parent_value: Amount::from_sat(546),
+            parent_script_pubkey: dest.clone(),
+            parent_tap_internal_key: Some(spend.internal_key()),
+            commit_txid: Txid::from_byte_array([2u8; 32]),
+            commit_vout: 0,
+            commit_value: Amount::from_sat(10_000),
+            commit_script_pubkey: commit_spk,
+            vault_script_pubkey: dest.clone(),
+            vault_value: Amount::from_sat(546),
+            child_script_pubkey: dest,
+            child_value: Amount::from_sat(546),
+            leaf_script: leaf,
+            spend_info: spend,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+            op_return: Some(vec![b'x'; 81]),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("80"));
+    }
+
+    #[test]
+    fn simple_reveal_baseline_and_op_return() {
+        let (commit_spk, spend, leaf) = mock_commit();
+        let dest = commit_spk.clone();
+        let base = RevealPsbtParams {
+            commit_txid: Txid::from_byte_array([3u8; 32]),
+            commit_vout: 0,
+            commit_value: Amount::from_sat(10_000),
+            commit_script_pubkey: commit_spk,
+            destination_script_pubkey: dest.clone(),
+            destination_value: Amount::from_sat(546),
+            leaf_script: leaf,
+            spend_info: spend,
+            op_return: None,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+        };
+        let none = build_reveal_psbt(RevealPsbtParams {
+            op_return: None,
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(none.unsigned_tx.output.len(), 1);
+
+        let with = build_reveal_psbt(RevealPsbtParams {
+            op_return: Some(b"hi".to_vec()),
+            ..base
+        })
+        .unwrap();
+        assert_eq!(with.unsigned_tx.output.len(), 2);
+        assert_eq!(with.unsigned_tx.output[0].value.to_sat(), 546);
+        assert!(with.unsigned_tx.output[1].script_pubkey.is_op_return());
     }
 }

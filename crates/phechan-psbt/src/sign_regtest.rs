@@ -346,8 +346,8 @@ mod tests {
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: None,
-        change_script_pubkey: None,
-        change_value: Amount::ZERO,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
         })
         .unwrap();
 
@@ -355,6 +355,38 @@ mod tests {
         let tx = finalize_to_tx(&signed).unwrap();
         assert!(!tx.input[0].witness.is_empty());
         assert_eq!(tx.output.len(), 1);
+    }
+
+    #[test]
+    fn sign_finalize_reveal_with_op_return() {
+        let key = derive_regtest_key(Network::Regtest, "sign-opr").unwrap();
+        let xonly = key.xonly.serialize();
+        let leaf = build_inscription_tapscript(&xonly, b"hi");
+        let commit = build_commit_output(Network::Regtest, &xonly, leaf.clone()).unwrap();
+
+        let fake_txid = Txid::from_byte_array([1u8; 32]);
+        let dest = commit.address.script_pubkey();
+        let psbt = build_reveal_psbt(RevealPsbtParams {
+            commit_txid: fake_txid,
+            commit_vout: 0,
+            commit_value: Amount::from_sat(10_000),
+            commit_script_pubkey: commit.script_pubkey.clone(),
+            destination_script_pubkey: dest,
+            destination_value: Amount::from_sat(9_500),
+            leaf_script: commit.leaf_script.clone(),
+            spend_info: commit.spend_info.clone(),
+            op_return: Some(b"msg".to_vec()),
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+        })
+        .unwrap();
+
+        let signed = sign_reveal_script_path(psbt, &key.keypair, &commit.leaf_script).unwrap();
+        let tx = finalize_to_tx(&signed).unwrap();
+        assert!(!tx.input[0].witness.is_empty());
+        assert_eq!(tx.output.len(), 2);
+        assert!(tx.output[1].script_pubkey.is_op_return());
+        assert_eq!(tx.output[1].value.to_sat(), 0);
     }
 
     #[test]

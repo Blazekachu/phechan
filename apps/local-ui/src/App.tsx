@@ -1351,13 +1351,17 @@ export default function App() {
       }
 
       // Snapshot so Profile can finish if reveal fails / is deferred.
+      // Always pin the payment address that funded the commit — reveal surplus
+      // (lower fee later) returns change there, not to ordinals.
       const savedPlan = snapshotPlan({
         ...plan,
+        network,
         destination: address,
         vaultAddress: address,
         parentAddress: parentAddress || address,
         ordinalsPublicKey: ordinalsPublicKey || undefined,
         sameSatParent: sameSatParent || undefined,
+        paymentAddress: payAddr,
         commitTxid,
         commitVout: 0,
         commitValue: commitSats,
@@ -1418,7 +1422,16 @@ export default function App() {
         await runRevealFromCommit(
           commitTxid,
           commitAddress,
-          undefined,
+          {
+            ...plan,
+            paymentAddress: payAddr,
+            commitTxid,
+            commitVout: 0,
+            commitValue: commitSats,
+            destination: address,
+            vaultAddress: address,
+            ordinalsPublicKey: ordinalsPublicKey || plan.ordinalsPublicKey,
+          },
           commitHexForPackage ? { commitHexForPackage } : undefined
         );
       } catch (revealErr) {
@@ -1539,6 +1552,15 @@ export default function App() {
     // Re-read so Profile fee/vanity edits apply even if list row is stale.
     const latest =
       listInterruptedCommits().find((x) => x.commitTxid === item.commitTxid) || item;
+    const commitNet = String(latest.network || latest.plan.network || "").toLowerCase();
+    const walletNet = String(network || "").toLowerCase();
+    if (commitNet && walletNet && commitNet !== walletNet) {
+      setOk(false);
+      setOut(
+        `Network mismatch: commit is on ${commitNet}, wallet is on ${walletNet}. Switch wallet network (or reconnect) before Send reveal.`
+      );
+      return;
+    }
     revealAbortRef.current?.abort();
     const ac = new AbortController();
     revealAbortRef.current = ac;
@@ -1549,14 +1571,27 @@ export default function App() {
     setPage("profile");
     setPendingReveal(latest);
     try {
+      // Change from a lower reveal fee must go to the payment address that funded
+      // the commit (saved in the bundle) — not the ordinals / vault address.
+      const revealPayAddr =
+        latest.plan.paymentAddress || paymentAddress || undefined;
+      if (!revealPayAddr) {
+        setOk(false);
+        setBusy(false);
+        setRevealingCommitTxid(null);
+        setOut(
+          "Missing payment address on this commit bundle. Re-download won’t help if it was never saved — reconnect the wallet that funded the commit (payment address), then Send reveal so surplus can return as change."
+        );
+        return;
+      }
       const p: InscribePlan = {
         ...latest.plan,
+        // Prefer interrupted/bundle network so reveal fee + vanity tip hit the right chain.
+        network: latest.network || latest.plan.network || network,
         destination: address,
         vaultAddress: address,
         ordinalsPublicKey: ordinalsPublicKey || latest.plan.ordinalsPublicKey,
-        // Needed so surplus at lower reveal fee returns as change (vout2).
-        paymentAddress:
-          latest.plan.paymentAddress || paymentAddress || undefined,
+        paymentAddress: revealPayAddr,
         // Avoid slow commit tx lookup when we already know the funded outpoint.
         commitVout: latest.plan.commitVout ?? 0,
         commitValue: latest.plan.commitValue,
@@ -1564,6 +1599,7 @@ export default function App() {
       // Persist cleared vanity / fee edits + commitVout for next attempt
       upsertInterruptedCommit({
         ...latest,
+        network: p.network || latest.network,
         plan: snapshotPlan(p),
       });
       await runRevealFromCommit(latest.commitTxid, latest.commitAddress, p, {
@@ -1900,8 +1936,11 @@ export default function App() {
                     <p className="field-help" style={{ margin: "0.25rem 0 0.5rem" }}>
                       Commit is already funded — edit <strong>reveal fee / vanity</strong> below, then
                       Send reveal. Lowering fee below the funded budget returns surplus as{" "}
-                      <strong>change to your payment address</strong> (vout2 on parent-child). Postage
-                      stays on the child; parent returns to vault.
+                      <strong>change to the payment address that funded the commit</strong>
+                      {item.plan.paymentAddress
+                        ? ` (${item.plan.paymentAddress.slice(0, 12)}…)`
+                        : ""}
+                      . Postage stays on the child / destination; parent returns to vault.
                     </p>
                   {signReview ? (
                     <p className="field-help" style={{ color: "var(--accent, #f97316)", margin: "0.35rem 0" }}>
@@ -1917,7 +1956,7 @@ export default function App() {
                   <div className="row two" style={{ marginBottom: "0.5rem" }}>
                     <div>
                       <label htmlFor={`rev-fee-${item.commitTxid.slice(0, 8)}`}>
-                        Reveal fee (sat/vB) — info only after fund
+                        Reveal fee (sat/vB)
                       </label>
                       <input
                         id={`rev-fee-${item.commitTxid.slice(0, 8)}`}

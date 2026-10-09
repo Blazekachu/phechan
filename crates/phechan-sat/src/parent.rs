@@ -103,6 +103,20 @@ mod tests {
     }
 
     #[test]
+    fn fifo_trailing_zero_op_return_value_does_not_steal_parent() {
+        // OP_RETURN is 0 sats after vault+child — must not move parent off vout0.
+        assert!(verify_parent_return(
+            ParentPlacementPolicy::FirstInFirstOut,
+            0,
+            0,
+            0,
+            &[1000, 5000],
+            &[1000, 4800, 0],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn fee_tail_fails() {
         let err = verify_parent_return(
             ParentPlacementPolicy::Custom,
