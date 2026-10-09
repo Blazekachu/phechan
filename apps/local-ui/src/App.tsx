@@ -621,14 +621,13 @@ export default function App() {
       commitTxid: string,
       expectedCommitAddress: string | undefined,
       planOverride?: InscribePlan,
-      opts?: { commitHexForPackage?: string; signal?: AbortSignal }
+      opts?: { signal?: AbortSignal }
     ) => {
       const activePlan = planOverride || plan;
       const sameSat = Boolean(activePlan.sameSatParent);
       const differentSat = Boolean(
         activePlan.parentId && activePlan.parentOutpoint && !sameSat
       );
-      const atomicPackage = Boolean(opts?.commitHexForPackage);
 
       if (!address) {
         throw new Error("Connect wallet first");
@@ -677,15 +676,9 @@ export default function App() {
       setFlowPhase("grinding");
       const grindMsg = hasRevealVanity
         ? `Grinding reveal TXID ${activePlan.vanityPrefix || ""}…${activePlan.vanitySuffix || ""} — wait (can take ~1 min). Do not click again.`
-        : atomicPackage
-          ? "Building reveal for atomic package…"
-          : "Building & broadcasting reveal…";
+        : "Building reveal PSBT…";
       setGrindNote(grindMsg);
-      setOut(
-        atomicPackage
-          ? `Commit signed (held for package): ${commitTxid}\n${grindMsg}`
-          : `Commit funded: ${commitTxid}\n${grindMsg}`
-      );
+      setOut(`Commit broadcast: ${commitTxid}\n${grindMsg}`);
 
       let rev: Awaited<ReturnType<typeof api.revealInscription>> | null = null;
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -749,20 +742,16 @@ export default function App() {
             ? "Review reveal (parent spend) before wallet sign"
             : "Review reveal before wallet sign",
           steps: [
-            atomicPackage
-              ? `Commit held for atomic package: ${commitTxid}`
-              : `Commit already broadcast: ${commitTxid}`,
+            `Commit already broadcast: ${commitTxid}`,
             differentSat
               ? "This PSBT spends the parent UTXO (vin0) + commit (vin1)."
               : "This PSBT spends the commit via inscription tapscript.",
             String(rev.parent_lands || ""),
             String(rev.child_lands || "Inscription lands on postage output."),
             custodyNote
-              ? "Self-custody: tapscript uses your wallet pubkey — only you can sign/reveal/recover (key-path)."
+              ? "Self-custody: tapscript uses your wallet pubkey — only you can sign/reveal/recover."
               : "Sign the required inputs in your wallet.",
-            atomicPackage
-              ? "After you approve, we submitpackage commit+reveal together (or sequential Esplora fallback)."
-              : "After you approve here, the wallet popup opens — then we broadcast via Esplora.",
+            "Sign = authorize this reveal. We broadcast it immediately after you approve in Xverse.",
           ].filter(Boolean),
           warnings: isMainnetNet
             ? ["Mainnet — real BTC. Wallet will show the same inputs/outputs."]
@@ -776,13 +765,11 @@ export default function App() {
               ? `predicted reveal TXID ${rev.vanity_reveal_txid} (not broadcast yet)`
               : "",
           ].filter(Boolean),
-          buttonLabel: "Sign reveal in wallet",
+          buttonLabel: "Sign & broadcast reveal",
         });
         if (!go) {
           throw new Error(
-            atomicPackage
-              ? `Cancelled before reveal sign.\nCommit not broadcast yet: ${commitTxid}\nNothing left the wallet.`
-              : `Cancelled before reveal sign.\nCommit unspent: ${commitTxid}\nOpen Profile → Send reveal to finish later.`
+            `Cancelled before reveal sign.\nCommit unspent: ${commitTxid}\nOpen Profile → Send reveal to finish later.`
           );
         }
         setSignReview(null);
@@ -801,22 +788,19 @@ export default function App() {
         for (let round = 1; round <= 2; round++) {
           setOut(
             [
-              atomicPackage
-                ? `Commit held: ${commitTxid}`
-                : `Commit broadcast: ${commitTxid}`,
+              `Commit broadcast: ${commitTxid}`,
               String(rev.parent_lands || ""),
               String(rev.child_lands || ""),
               round === 1
                 ? differentSat
-                  ? "Sign reveal in wallet (parent vin0 + commit vin1)…"
-                  : "Sign reveal in wallet to finish inscription…"
-                : atomicPackage
-                  ? `Wallet cancelled — prompt ${round}: approve sign (commit still not broadcast).`
-                  : `Wallet cancelled — prompt ${round}: approve sign to finish (commit already broadcast).`,
+                  ? "Sign reveal in wallet (parent vin0 + commit vin1) — then we broadcast…"
+                  : "Sign reveal in wallet — then we broadcast…"
+                : `Wallet cancelled — prompt ${round}: approve sign to broadcast reveal (commit already on network).`,
             ]
               .filter(Boolean)
               .join("\n")
           );
+          // Wallet signs only; Phechan broadcasts immediately after (Xverse broadcast is unreliable).
           const signedReveal = await signPsbtWithWallet(String(rev.psbt_base64), {
             broadcast: false,
             signInputs: { [address]: indices },
@@ -829,75 +813,26 @@ export default function App() {
           if (isWalletCancel(msg) && round < 2) {
             continue;
           }
-          throw new Error(
-            atomicPackage
-              ? `${msg}\n\nCommit not broadcast — safe to retry.`
-              : `${msg}\n\nCommit unspent: ${commitTxid}`
-          );
+          throw new Error(`${msg}\n\nCommit unspent: ${commitTxid}`);
         }
 
-        if (atomicPackage && opts?.commitHexForPackage) {
-          setOut("Wallet signed — finalizing reveal & submitting atomic package…");
-          const fin = await api.finalizeFundingPsbt({
+        setOut("Wallet signed — broadcasting reveal now…");
+        let fin: Awaited<ReturnType<typeof api.finalizeFundingPsbt>> | null = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          fin = await api.finalizeFundingPsbt({
             base64: signedPsbt,
             network: activePlan.network || network,
-            broadcast: false,
+            broadcast: true,
           });
-          const revealHex = String(fin.hex || "");
-          if (!fin.ok || !revealHex) {
-            throw new Error(
-              String(fin.error || fin.stderr || "Reveal finalize produced no hex")
-            );
+          revealTxid = String(fin.broadcast_txid || "");
+          if (fin.ok && revealTxid) break;
+          const err = String(fin.error || fin.stderr || "Reveal broadcast failed");
+          if (attempt < 4 && isTransientError(err)) {
+            setOut(`Broadcast retry ${attempt + 1}… (${err})`);
+            await sleep(1200 * (attempt + 1));
+            continue;
           }
-          const plannedReveal = String(fin.txid || "");
-          const pkg = await api.submitPackage({
-            network: activePlan.network || network,
-            commitHex: opts.commitHexForPackage,
-            revealHex,
-          });
-          if (!pkg.ok && pkg.error) {
-            throw new Error(String(pkg.error));
-          }
-          const txids = Array.isArray(pkg.txids) ? pkg.txids : [];
-          revealTxid =
-            txids[1] ||
-            txids.find((t) => t !== commitTxid) ||
-            plannedReveal ||
-            "";
-          if (!revealTxid) {
-            throw new Error(
-              `Package submitted (${pkg.package_via || "?"}) but no reveal txid.\n${formatResult(pkg)}`
-            );
-          }
-          setOut(
-            [
-              `Atomic package via ${pkg.package_via || "unknown"}`,
-              pkg.package_note || "",
-              `commit: ${txids[0] || commitTxid}`,
-              `reveal: ${revealTxid}`,
-            ]
-              .filter(Boolean)
-              .join("\n")
-          );
-        } else {
-          setOut("Wallet signed — broadcasting reveal via Esplora…");
-          let fin: Awaited<ReturnType<typeof api.finalizeFundingPsbt>> | null = null;
-          for (let attempt = 0; attempt < 5; attempt++) {
-            fin = await api.finalizeFundingPsbt({
-              base64: signedPsbt,
-              network: activePlan.network || network,
-              broadcast: true,
-            });
-            revealTxid = String(fin.broadcast_txid || "");
-            if (fin.ok && revealTxid) break;
-            const err = String(fin.error || fin.stderr || "Reveal broadcast failed");
-            if (attempt < 4 && isTransientError(err)) {
-              setOut(`Broadcast retry ${attempt + 1}… (${err})`);
-              await sleep(1200 * (attempt + 1));
-              continue;
-            }
-            throw new Error(`${err}\n\nCommit unspent: ${commitTxid}\n${formatResult(fin)}`);
-          }
+          throw new Error(`${err}\n\nCommit unspent: ${commitTxid}\n${formatResult(fin)}`);
         }
       } else {
         revealTxid = String(rev.reveal_txid || rev.broadcast_txid || "");
@@ -1238,7 +1173,7 @@ export default function App() {
             ? "Wallet will sign Ordinals (vin0 / inscription sat) + Payment (vin1) in one prompt."
             : "Wallet will sign Ordinals (inscription sat as vin0) only."
           : "Wallet will sign Payment funding input.",
-        "Nothing is broadcast until you approve below and then approve in Xverse.",
+        "Each wallet sign is broadcast immediately after you approve in Xverse (via your local node).",
         ...(isControlPace
           ? [
               "After commit confirms in mempool/chain, a .phechan.json bundle downloads — reveal is not automatic.",
@@ -1315,53 +1250,27 @@ export default function App() {
       }
 
       let commitTxid = "";
-      let commitHexForPackage: string | undefined;
-      // Wallet self-custody + Xverse: NEVER hold an unbroadcast commit across
-      // reveal sign. Xverse returns "txn error" when the spent outpoint is not
-      // yet in mempool/chain (non_witness_utxo alone is not enough). This covers
-      // standalone, different-sat parent-child, same-sat, and sat-carrier Fast.
-      // Control / Profile already broadcast commit before reveal. Same-sat /
-      // carrier accept a short commit-only window instead of a hard wallet fail.
-      // (submitpackage atomic pairing is incompatible with wallet-signed reveals.)
-      const useAtomicPackage = false;
-
+      // Rule: every wallet sign is broadcast immediately (via local node / Esplora).
+      // We never hold a signed commit or reveal for later packaging.
       if (signedPsbt) {
-        setOut(
-          useAtomicPackage
-            ? "Wallet signed — finalizing commit (held for atomic package)…"
-            : "Wallet signed — broadcasting funding via Esplora…"
-        );
+        setOut("Wallet signed — broadcasting commit now…");
         const fin = await api.finalizeFundingPsbt({
           base64: signedPsbt,
           network,
-          broadcast: !useAtomicPackage,
+          broadcast: true,
           paymentPublicKey: paymentPublicKey || undefined,
         });
-        if (useAtomicPackage) {
-          commitHexForPackage = String(fin.hex || "");
-          commitTxid = String(fin.txid || signedTxid || "");
-          if (!fin.ok || !commitHexForPackage || !commitTxid) {
-            throw new Error(
-              String(
-                fin.error ||
-                  fin.stderr ||
-                  `Commit finalize failed (needed for atomic package).\n${formatResult(fin)}`
-              )
-            );
-          }
-        } else {
-          const broadcasted = String(fin.broadcast_txid || signedTxid || "");
-          if (!fin.ok || !broadcasted) {
-            throw new Error(
-              String(
-                fin.error ||
-                  fin.stderr ||
-                  `Funding broadcast failed.\n${formatResult(fin)}`
-              )
-            );
-          }
-          commitTxid = broadcasted;
+        const broadcasted = String(fin.broadcast_txid || signedTxid || "");
+        if (!fin.ok || !broadcasted) {
+          throw new Error(
+            String(
+              fin.error ||
+                fin.stderr ||
+                `Funding broadcast failed.\n${formatResult(fin)}`
+            )
+          );
         }
+        commitTxid = broadcasted;
       } else if (signedTxid) {
         commitTxid = signedTxid;
       }
@@ -1394,10 +1303,8 @@ export default function App() {
         savedAt: Date.now(),
         plan: savedPlan,
       };
-      if (!useAtomicPackage) {
-        upsertInterruptedCommit(interruptedItem);
-        refreshInterrupted();
-      }
+      upsertInterruptedCommit(interruptedItem);
+      refreshInterrupted();
 
       if (isControlPace) {
         setPendingReveal(interruptedItem);
@@ -1428,42 +1335,28 @@ export default function App() {
         return;
       }
 
-      // Fast: chain reveal in the same session (atomic package when wallet self-custody).
+      // Fast: commit is already broadcast; chain reveal sign → broadcast in this session.
       setPendingReveal(null);
       setOut(
-        useAtomicPackage
-          ? useSatCarrier
-            ? `Commit held for package: ${commitTxid}\nReveal — target sat already in commit…`
-            : `Commit held for package: ${commitTxid}\nSigning reveal for atomic submitpackage…`
-          : useSatCarrier
-            ? `Commit broadcast: ${commitTxid}\nReveal — target sat already in commit…`
-            : `Commit broadcast: ${commitTxid}\nFinishing reveal (fast mode)…`
+        useSatCarrier
+          ? `Commit broadcast: ${commitTxid}\nReveal — target sat already in commit…`
+          : `Commit broadcast: ${commitTxid}\nFinishing reveal (fast mode)…`
       );
       try {
-        await runRevealFromCommit(
+        await runRevealFromCommit(commitTxid, commitAddress, {
+          ...plan,
+          paymentAddress: payAddr,
           commitTxid,
-          commitAddress,
-          {
-            ...plan,
-            paymentAddress: payAddr,
-            commitTxid,
-            commitVout: 0,
-            commitValue: commitSats,
-            commitTxHex: commitHexForPackage || undefined,
-            destination: address,
-            vaultAddress: address,
-            ordinalsPublicKey: ordinalsPublicKey || plan.ordinalsPublicKey,
-          },
-          commitHexForPackage ? { commitHexForPackage } : undefined
-        );
+          commitVout: 0,
+          commitValue: commitSats,
+          destination: address,
+          vaultAddress: address,
+          ordinalsPublicKey: ordinalsPublicKey || plan.ordinalsPublicKey,
+        });
       } catch (revealErr) {
-        if (!useAtomicPackage) {
-          refreshInterrupted();
-        }
+        refreshInterrupted();
         throw new Error(
-          useAtomicPackage
-            ? `${String(revealErr)}\n\nCommit was not broadcast — nothing stuck on-chain. Retry Inscribe.`
-            : `${String(revealErr)}\n\nCommit is broadcast. Open Profile → Send reveal to finish without funding again.`
+          `${String(revealErr)}\n\nCommit is broadcast. Open Profile → Send reveal to finish without funding again.`
         );
       }
     } catch (e) {
@@ -2781,15 +2674,18 @@ export default function App() {
           </p>
           <p>Reveal transaction is signed with your public key, adding another layer of provenance.</p>
           <p>You can recover funds from the tapscript address with a key-path spend.</p>
-          <h3 className="custody-heading">Broadcast order</h3>
+          <h3 className="custody-heading">What a sign means</h3>
           <p>
-            With wallet self-custody, Fast broadcasts the commit after payment sign, then asks you
-            to sign reveal. Xverse cannot sign a reveal that spends a commit that is still held
-            offline (shows &quot;txn error&quot;).
+            <strong>Sign #1 (Payment)</strong> — authorize the funding tx that creates the commit
+            output. We broadcast that commit immediately.
           </p>
           <p>
-            Control / Profile already use commit-first. Same-sat and sat-carrier Fast therefore have
-            a short commit-only window before reveal — preferable to a hard wallet failure.
+            <strong>Sign #2 (Ordinals)</strong> — authorize the reveal that spends the commit (and
+            parent, for FI/FO). We broadcast that reveal immediately.
+          </p>
+          <p>
+            Control only defers <em>when</em> you do sign #2 — it does not hold a signed tx
+            unbroadcast. We never keep a wallet-signed transaction offline for later packaging.
           </p>
         </div>
 
