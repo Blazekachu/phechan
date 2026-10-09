@@ -52,6 +52,9 @@ pub struct RevealPsbtParams {
     /// Optional change back to payment address when commit was over-funded for reveal fee.
     pub change_script_pubkey: Option<ScriptBuf>,
     pub change_value: Amount,
+    /// Full previous commit tx (BIP-174 non_witness_utxo). Needed when the commit is
+    /// not yet broadcast (atomic Fast package) so wallets like Xverse can validate.
+    pub commit_prev_tx: Option<Transaction>,
 }
 
 /// Parent+child reveal: input0=parent, input1=commit;
@@ -78,6 +81,8 @@ pub struct ParentChildRevealParams {
     pub change_value: Amount,
     /// Optional OP_RETURN payload (vout0 when present). Max 80 bytes for standard relay.
     pub op_return: Option<Vec<u8>>,
+    /// Full previous commit tx for vin1 (atomic Fast / wallet validation).
+    pub commit_prev_tx: Option<Transaction>,
 }
 
 /// Build unsigned reveal PSBT: spend commit via tapscript to [OP_RETURN?] destination [+ change].
@@ -125,6 +130,7 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
             value: params.commit_value,
             script_pubkey: params.commit_script_pubkey,
         }),
+        non_witness_utxo: params.commit_prev_tx,
         ..Default::default()
     };
     input.tap_scripts.insert(
@@ -211,6 +217,7 @@ pub fn build_parent_child_reveal_psbt(
             value: params.commit_value,
             script_pubkey: params.commit_script_pubkey,
         }),
+        non_witness_utxo: params.commit_prev_tx,
         ..Default::default()
     };
     commit_in
@@ -273,6 +280,7 @@ mod tests {
             change_script_pubkey: change_spk,
             change_value,
             op_return,
+            commit_prev_tx: None,
         })
         .unwrap()
     }
@@ -376,6 +384,7 @@ mod tests {
             change_script_pubkey: None,
             change_value: Amount::ZERO,
             op_return: Some(vec![b'x'; 81]),
+            commit_prev_tx: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("80"));
@@ -397,6 +406,7 @@ mod tests {
             op_return: None,
             change_script_pubkey: None,
             change_value: Amount::ZERO,
+            commit_prev_tx: None,
         };
         let none = build_reveal_psbt(RevealPsbtParams {
             op_return: None,

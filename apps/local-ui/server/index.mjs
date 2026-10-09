@@ -536,6 +536,8 @@ function planToCliArgs(plan, { dryRun = true, unsignedPsbt = false } = {}) {
     args.push("--commit-txid", String(plan.commitTxid));
     if (plan.commitVout != null) args.push("--commit-vout", String(plan.commitVout));
     if (plan.commitValue != null) args.push("--commit-value", String(plan.commitValue));
+    // Full commit tx so wallet can validate reveal while commit is still unbroadcast (atomic Fast).
+    if (plan.commitTxHex) args.push("--commit-tx-hex", String(plan.commitTxHex));
   }
   // Sat number / inscription targeting — pass as sat-number or satpoint when verified
   if (plan.satTarget) {

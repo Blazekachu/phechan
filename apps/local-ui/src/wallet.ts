@@ -369,6 +369,8 @@ export async function signPsbtWithWallet(
   opts?: {
     signInputs?: Record<string, number[]>;
     broadcast?: boolean;
+    /** BIP341/BIP143 sighash; Xverse currently treats this as required (SIGHASH_ALL = 1). */
+    allowedSignHash?: number;
   }
 ): Promise<{ ok: boolean; psbt?: string; txid?: string; message: string }> {
   const p = getProvider();
@@ -378,6 +380,8 @@ export async function signPsbtWithWallet(
       psbt: psbtBase64,
       // Default false: Xverse's own broadcast frequently returns HTTP 400 on signet
       broadcast: Boolean(opts?.broadcast),
+      // Required by current Xverse builds when omitted (see sats-connect #174).
+      allowedSignHash: opts?.allowedSignHash ?? 1,
     };
     if (opts?.signInputs) params.signInputs = opts.signInputs;
 

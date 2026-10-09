@@ -348,6 +348,7 @@ mod tests {
             op_return: None,
             change_script_pubkey: None,
             change_value: Amount::ZERO,
+            commit_prev_tx: None,
         })
         .unwrap();
 
@@ -378,6 +379,7 @@ mod tests {
             op_return: Some(b"msg".to_vec()),
             change_script_pubkey: None,
             change_value: Amount::ZERO,
+            commit_prev_tx: None,
         })
         .unwrap();
 

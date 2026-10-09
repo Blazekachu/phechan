@@ -73,6 +73,8 @@ export type InscribePlan = {
   fundingAddress?: string;
   /** Wallet-funded commit tx */
   commitTxid?: string;
+  /** Raw commit tx hex — attached as PSBT non_witness_utxo for atomic Fast (unbroadcast commit). */
+  commitTxHex?: string;
   commitVout?: number;
   commitValue?: number;
   /** Auto-attached after disclosure on mainnet (not typed by user) */

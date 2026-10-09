@@ -68,6 +68,10 @@ function sleep(ms: number) {
 }
 
 function isWalletCancel(msg: string) {
+  // Do not treat wallet "txn error" / validation failures as cancel (those need a hard stop).
+  if (/txn error|transaction error|unknown output|unspendable|invalid/i.test(msg)) {
+    return false;
+  }
   return /cancel|reject|denied|4001/i.test(msg);
 }
 
@@ -1216,7 +1220,9 @@ export default function App() {
             ? `Reinscription on sat UTXO ${carrierOutpoint} — ordinals vin0 moves the sat into commit${needPaymentTopUp ? "; payment top-up vin1" : ""}.`
             : isControlPace
               ? "Standalone inscription — fund commit now; reveal when you choose (bundle auto-downloads)."
-              : "Standalone inscription — one funding sign, then automatic reveal.",
+              : ordinalsPublicKey
+                ? "Standalone inscription — sign #1 funds commit (Payment); sign #2 reveals (Ordinals tapscript). Not parent-child."
+                : "Standalone inscription — one funding sign, then automatic reveal.",
         `Commit output: ${commitSats} sats → ${commitAddress}`,
         isControlPace
           ? `Commit fee ${feeR} sat/vB · reveal budget ${parseFeeRateInput(revealFeeRate)} sat/vB · postage ${postage} sats`
@@ -1273,7 +1279,9 @@ export default function App() {
             : "Sign once: Ordinals — inscription sat moves into commit…\n"
           : parentChildDifferentSat
             ? "Sign #1 of 2: Payment funds commit (Ordinals signs parent at reveal)…\n"
-            : "Sign funding in wallet…\n") +
+            : ordinalsPublicKey
+              ? "Sign #1 of 2: Payment funds commit (Ordinals signs reveal next)…\n"
+              : "Sign funding in wallet…\n") +
           `(${fundPsbt.commit_funding_fee_sats || "?"} sat fee @ ${feeR} sat/vB)` +
           (fundPsbt.commit_vanity_txid ? `\nCommit vanity TXID ${fundPsbt.commit_vanity_txid}` : "")
       );
@@ -1428,6 +1436,7 @@ export default function App() {
             commitTxid,
             commitVout: 0,
             commitValue: commitSats,
+            commitTxHex: commitHexForPackage || undefined,
             destination: address,
             vaultAddress: address,
             ordinalsPublicKey: ordinalsPublicKey || plan.ordinalsPublicKey,

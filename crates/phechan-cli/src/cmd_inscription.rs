@@ -343,6 +343,7 @@ fn estimate_reveal_fee_sats(
             change_script_pubkey: None,
             change_value: Amount::ZERO,
             op_return: op_return.map(|d| d.to_vec()),
+            commit_prev_tx: None,
         })
         .map_err(|e| e.to_string())?;
         let mut tx = psbt.unsigned_tx;
@@ -365,8 +366,9 @@ fn estimate_reveal_fee_sats(
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: op_return.map(|d| d.to_vec()),
-        change_script_pubkey: None,
-        change_value: Amount::ZERO,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+            commit_prev_tx: None,
         })
         .map_err(|e| e.to_string())?;
 
@@ -401,6 +403,17 @@ fn reveal_layout_with_op_return(has_op_return: bool) -> (usize, usize, usize) {
     } else {
         (0, 1, 2)
     }
+}
+
+/// Optional full commit tx for PSBT `non_witness_utxo` (atomic Fast / wallet validation).
+fn parse_commit_prev_tx(args: &[String]) -> Result<Option<bitcoin::Transaction>, String> {
+    let Some(hex_s) = flag_value(args, "--commit-tx-hex") else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(hex_s.trim()).map_err(|e| format!("--commit-tx-hex: {e}"))?;
+    bitcoin::consensus::deserialize(&bytes)
+        .map(Some)
+        .map_err(|e| format!("--commit-tx-hex: invalid tx: {e}"))
 }
 
 /// Parse optional `--op-return` UTF-8 message (≤80 bytes) for reveal nulldata output.
@@ -1228,8 +1241,9 @@ fn run_single_reveal(
             leaf_script: commit.leaf_script.clone(),
             spend_info: commit.spend_info.clone(),
             op_return: parse_op_return(args)?,
-        change_script_pubkey: None,
-        change_value: Amount::ZERO,
+            change_script_pubkey: None,
+            change_value: Amount::ZERO,
+            commit_prev_tx: None,
         })
         .map_err(|e| e.to_string())?;
 
@@ -1448,6 +1462,7 @@ fn run_single_reveal(
         op_return: parse_op_return(args)?,
         change_script_pubkey: if change_sats > 0 { change_spk.clone() } else { None },
         change_value: Amount::from_sat(change_sats),
+        commit_prev_tx: parse_commit_prev_tx(args)?,
     })
     .map_err(|e| e.to_string())?;
 
@@ -1759,6 +1774,7 @@ fn reveal_parent_child_wallet(
         },
         change_value: Amount::from_sat(change_sats),
         op_return,
+        commit_prev_tx: parse_commit_prev_tx(args)?,
     })
     .map_err(|e| e.to_string())?;
 
@@ -2100,6 +2116,7 @@ fn child(args: &[String]) -> Result<(), String> {
         change_script_pubkey: None,
         change_value: Amount::ZERO,
         op_return,
+        commit_prev_tx: parse_commit_prev_tx(args)?,
     })
     .map_err(|e| e.to_string())?;
 
@@ -2257,8 +2274,9 @@ fn recover_reveal(args: &[String]) -> Result<(), String> {
         leaf_script: commit.leaf_script.clone(),
         spend_info: commit.spend_info.clone(),
         op_return: parse_op_return(args)?,
-    change_script_pubkey: None,
-    change_value: Amount::ZERO,
+        change_script_pubkey: None,
+        change_value: Amount::ZERO,
+        commit_prev_tx: parse_commit_prev_tx(args)?,
     })
     .map_err(|e| e.to_string())?;
 
