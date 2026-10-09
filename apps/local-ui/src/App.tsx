@@ -803,11 +803,13 @@ export default function App() {
             [
               atomicPackage
                 ? `Commit held: ${commitTxid}`
-                : `Commit funded: ${commitTxid}`,
+                : `Commit broadcast: ${commitTxid}`,
               String(rev.parent_lands || ""),
               String(rev.child_lands || ""),
               round === 1
-                ? "Sign reveal in wallet to finish inscription…"
+                ? differentSat
+                  ? "Sign reveal in wallet (parent vin0 + commit vin1)…"
+                  : "Sign reveal in wallet to finish inscription…"
                 : atomicPackage
                   ? `Wallet cancelled — prompt ${round}: approve sign (commit still not broadcast).`
                   : `Wallet cancelled — prompt ${round}: approve sign to finish (commit already broadcast).`,
@@ -1311,13 +1313,15 @@ export default function App() {
       let commitTxid = "";
       let commitHexForPackage: string | undefined;
       // Xverse often fails signing a reveal that spends an *unbroadcast* commit
-      // ("txn error"), even with non_witness_utxo. Reserve atomic hold for
-      // same-sat / sat-carrier (valuable sat already inside commit). Standalone
-      // Fast: broadcast commit first, then sign reveal against a live UTXO.
+      // ("txn error"), even with non_witness_utxo. Atomic hold only when the
+      // valuable sat is already inside the commit (same-sat / sat-carrier).
+      // Different-sat parent-child + standalone: broadcast commit first — parent
+      // stays in the wallet until reveal, so holding the commit is unnecessary.
       const useAtomicPackage =
         Boolean(ordinalsPublicKey) &&
         !isControlPace &&
-        (useSatCarrier || sameSatParent);
+        !parentChildDifferentSat &&
+        (sameSatParent || useSatCarrier);
 
       if (signedPsbt) {
         setOut(
