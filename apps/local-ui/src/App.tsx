@@ -798,7 +798,7 @@ export default function App() {
         const indices = parentOnly ? [0] : differentSat && custodyNote ? [0, 1] : signIdx;
 
         let signedPsbt = "";
-        for (let round = 1; ; round++) {
+        for (let round = 1; round <= 2; round++) {
           setOut(
             [
               atomicPackage
@@ -824,7 +824,7 @@ export default function App() {
             break;
           }
           const msg = signedReveal.message || "Wallet did not sign reveal";
-          if (isWalletCancel(msg)) {
+          if (isWalletCancel(msg) && round < 2) {
             continue;
           }
           throw new Error(
@@ -1310,7 +1310,14 @@ export default function App() {
 
       let commitTxid = "";
       let commitHexForPackage: string | undefined;
-      const useAtomicPackage = Boolean(ordinalsPublicKey) && !isControlPace;
+      // Xverse often fails signing a reveal that spends an *unbroadcast* commit
+      // ("txn error"), even with non_witness_utxo. Reserve atomic hold for
+      // same-sat / sat-carrier (valuable sat already inside commit). Standalone
+      // Fast: broadcast commit first, then sign reveal against a live UTXO.
+      const useAtomicPackage =
+        Boolean(ordinalsPublicKey) &&
+        !isControlPace &&
+        (useSatCarrier || sameSatParent);
 
       if (signedPsbt) {
         setOut(

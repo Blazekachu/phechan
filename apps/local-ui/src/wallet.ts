@@ -395,11 +395,8 @@ export async function signPsbtWithWallet(
         const err = asRecord(o.error) || o;
         const msg = String(err.message || o.message || "Wallet signing failed");
         const code = Number(err.code);
-        if (
-          code === 4001 ||
-          code === -32000 ||
-          /reject|cancel|denied/i.test(msg)
-        ) {
+        // Only 4001 is user-reject. -32000 is a generic RPC failure (often "txn error").
+        if (code === 4001 || (/^(user rejected|rejected by user|denied by user)/i.test(msg) && !/txn|transaction|output|script/i.test(msg))) {
           return {
             ok: false,
             message:
@@ -413,13 +410,17 @@ export async function signPsbtWithWallet(
               "Xverse rejected the request (HTTP 400). Usually their broadcast backend — Phechan now signs without wallet broadcast; reconnect and retry.",
           };
         }
-        return { ok: false, message: msg };
+        return {
+          ok: false,
+          message: code ? `Wallet error ${code}: ${msg}` : msg,
+        };
       }
       // JSON-RPC envelope: { jsonrpc, error } or { jsonrpc, result }
       if (o.jsonrpc && o.error) {
         const err = asRecord(o.error);
         const msg = String(err?.message || "Wallet signing failed");
-        if (/reject|cancel|denied/i.test(msg)) {
+        const code = Number(err?.code);
+        if (code === 4001 || (/^(user rejected|rejected by user|denied by user)/i.test(msg) && !/txn|transaction|output|script/i.test(msg))) {
           return {
             ok: false,
             message:
@@ -433,7 +434,10 @@ export async function signPsbtWithWallet(
               "Xverse HTTP 400 (often wallet broadcast). Retry — we sign only and broadcast via your local node.",
           };
         }
-        return { ok: false, message: msg };
+        return {
+          ok: false,
+          message: code ? `Wallet error ${code}: ${msg}` : msg,
+        };
       }
     }
 
@@ -464,7 +468,10 @@ export async function signPsbtWithWallet(
     };
   } catch (e) {
     const msg = String(e);
-    if (/reject|cancel|denied/i.test(msg)) {
+    if (
+      /user rejected|rejected by user|denied by user|4001/i.test(msg) &&
+      !/txn|transaction|output|script/i.test(msg)
+    ) {
       return {
         ok: false,
         message:
