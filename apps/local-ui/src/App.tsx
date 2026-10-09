@@ -1210,20 +1210,24 @@ export default function App() {
         `Content: ${modeLabel}`,
         parentId.trim()
           ? sameSatParent
-            ? `Same-sat child on parent ${parentId.trim()} — parent UTXO funds commit; one wallet sign${
-                isControlPace ? "; reveal later when you choose" : "; then automatic reveal"
-              }.`
-            : `Different-sat child of ${parentId.trim()} — sign #1 funds commit (Payment)${
+            ? `Same-sat child on parent ${parentId.trim()} — parent UTXO funds commit${
+                isControlPace
+                  ? "; reveal later when you choose."
+                  : "; sign #1 broadcasts commit, sign #2 reveals."
+              }`
+            : `Different-sat child of ${parentId.trim()} — sign #1 funds+broadcasts commit (Payment)${
                 isControlPace
                   ? "; reveal later signs parent (Ordinals)."
-                  : "; after broadcast, sign #2 spends parent (Ordinals)."
+                  : "; sign #2 spends parent+commit (Ordinals)."
               }`
           : useSatCarrier
-            ? `Reinscription on sat UTXO ${carrierOutpoint} — ordinals vin0 moves the sat into commit${needPaymentTopUp ? "; payment top-up vin1" : ""}.`
+            ? `Reinscription on sat UTXO ${carrierOutpoint} — ordinals vin0 moves the sat into commit${needPaymentTopUp ? "; payment top-up vin1" : ""}${
+                isControlPace ? "." : "; then sign #2 reveals."
+              }`
             : isControlPace
               ? "Standalone inscription — fund commit now; reveal when you choose (bundle auto-downloads)."
               : ordinalsPublicKey
-                ? "Standalone inscription — sign #1 funds commit (Payment); sign #2 reveals (Ordinals tapscript). Not parent-child."
+                ? "Standalone — sign #1 funds+broadcasts commit (Payment); sign #2 reveals (Ordinals). Not parent-child."
                 : "Standalone inscription — one funding sign, then automatic reveal.",
         `Commit output: ${commitSats} sats → ${commitAddress}`,
         isControlPace
@@ -1312,16 +1316,14 @@ export default function App() {
 
       let commitTxid = "";
       let commitHexForPackage: string | undefined;
-      // Xverse often fails signing a reveal that spends an *unbroadcast* commit
-      // ("txn error"), even with non_witness_utxo. Atomic hold only when the
-      // valuable sat is already inside the commit (same-sat / sat-carrier).
-      // Different-sat parent-child + standalone: broadcast commit first — parent
-      // stays in the wallet until reveal, so holding the commit is unnecessary.
-      const useAtomicPackage =
-        Boolean(ordinalsPublicKey) &&
-        !isControlPace &&
-        !parentChildDifferentSat &&
-        (sameSatParent || useSatCarrier);
+      // Wallet self-custody + Xverse: NEVER hold an unbroadcast commit across
+      // reveal sign. Xverse returns "txn error" when the spent outpoint is not
+      // yet in mempool/chain (non_witness_utxo alone is not enough). This covers
+      // standalone, different-sat parent-child, same-sat, and sat-carrier Fast.
+      // Control / Profile already broadcast commit before reveal. Same-sat /
+      // carrier accept a short commit-only window instead of a hard wallet fail.
+      // (submitpackage atomic pairing is incompatible with wallet-signed reveals.)
+      const useAtomicPackage = false;
 
       if (signedPsbt) {
         setOut(
@@ -2779,20 +2781,16 @@ export default function App() {
           </p>
           <p>Reveal transaction is signed with your public key, adding another layer of provenance.</p>
           <p>You can recover funds from the tapscript address with a key-path spend.</p>
-          <h3 className="custody-heading">Atomic</h3>
+          <h3 className="custody-heading">Broadcast order</h3>
           <p>
-            Fast mode uses Bitcoin&apos;s{" "}
-            <a
-              href="https://bitcoincore.org/en/doc/26.0.0/rpc/rawtransactions/submitpackage/"
-              target="_blank"
-              rel="noreferrer"
-            >
-              submitpackage
-            </a>{" "}
-            (local node) so commit and reveal broadcast in tandem — Esplora sequential fallback when
-            RPC is unavailable.
+            With wallet self-custody, Fast broadcasts the commit after payment sign, then asks you
+            to sign reveal. Xverse cannot sign a reveal that spends a commit that is still held
+            offline (shows &quot;txn error&quot;).
           </p>
-          <p>Parent inscriptions and rare sats never get stuck in a commit-only state.</p>
+          <p>
+            Control / Profile already use commit-first. Same-sat and sat-carrier Fast therefore have
+            a short commit-only window before reveal — preferable to a hard wallet failure.
+          </p>
         </div>
 
         {showPreview && contentPreview && (
