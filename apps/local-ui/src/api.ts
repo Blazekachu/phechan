@@ -33,7 +33,7 @@ export type InscribePlan = {
    * with tag 3 (no FI/FO). Inferred in UI when parent + sat target resolve to same outpoint.
    */
   sameSatParent?: boolean;
-  /** Where parent sat returns (vout0) — usually ordinals address */
+  /** Where parent sat returns (vout0, or vout1 when OP_RETURN set) — usually ordinals address */
   vaultAddress?: string;
   /** Ordinals / taproot x-only pubkey for parent input signing */
   ordinalsPublicKey?: string;

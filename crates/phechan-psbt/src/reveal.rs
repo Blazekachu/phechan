@@ -8,8 +8,8 @@ use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 
 use crate::PsbtBuildError;
 
-/// Append optional nulldata last. Empty / None = no-op (preserves legacy layouts).
-fn append_op_return(
+/// Prepend optional nulldata as vout0. Empty / None = no-op (preserves no-message layouts).
+fn prepend_op_return(
     outputs: &mut Vec<TxOut>,
     op_return: Option<Vec<u8>>,
 ) -> Result<(), PsbtBuildError> {
@@ -27,10 +27,13 @@ fn append_op_return(
     let push: &bitcoin::script::PushBytes = data.as_slice().try_into().map_err(|_| {
         PsbtBuildError::Message("OP_RETURN payload too large for push".into())
     })?;
-    outputs.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::new_op_return(push),
-    });
+    outputs.insert(
+        0,
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(push),
+        },
+    );
     Ok(())
 }
 
@@ -44,14 +47,15 @@ pub struct RevealPsbtParams {
     pub destination_value: Amount,
     pub leaf_script: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
-    /// Optional OP_RETURN payload (after dest [+ change]). Max 80 bytes for standard relay.
+    /// Optional OP_RETURN payload (vout0 when present). Max 80 bytes for standard relay.
     pub op_return: Option<Vec<u8>>,
     /// Optional change back to payment address when commit was over-funded for reveal fee.
     pub change_script_pubkey: Option<ScriptBuf>,
     pub change_value: Amount,
 }
 
-/// Parent+child reveal: input0=parent, input1=commit; out0=vault, out1=child [, change] [, OP_RETURN].
+/// Parent+child reveal: input0=parent, input1=commit;
+/// outs: [OP_RETURN?] vault, child [, change].
 pub struct ParentChildRevealParams {
     pub parent_txid: Txid,
     pub parent_vout: u32,
@@ -72,11 +76,11 @@ pub struct ParentChildRevealParams {
     /// Optional change (after child) — surplus commit sats after postage + miner fee.
     pub change_script_pubkey: Option<ScriptBuf>,
     pub change_value: Amount,
-    /// Optional OP_RETURN payload (after vault + child [+ change]). Max 80 bytes for standard relay.
+    /// Optional OP_RETURN payload (vout0 when present). Max 80 bytes for standard relay.
     pub op_return: Option<Vec<u8>>,
 }
 
-/// Build unsigned reveal PSBT: spend commit via tapscript to destination [+ change] [+ OP_RETURN].
+/// Build unsigned reveal PSBT: spend commit via tapscript to [OP_RETURN?] destination [+ change].
 pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildError> {
     let mut outputs = vec![TxOut {
         value: params.destination_value,
@@ -91,7 +95,7 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
             script_pubkey: spk,
         });
     }
-    append_op_return(&mut outputs, params.op_return)?;
+    prepend_op_return(&mut outputs, params.op_return)?;
 
     let tx = Transaction {
         version: Version::TWO,
@@ -133,7 +137,7 @@ pub fn build_reveal_psbt(params: RevealPsbtParams) -> Result<Psbt, PsbtBuildErro
     Ok(psbt)
 }
 
-/// Build FI/FO parent+child reveal PSBT (parent input first, vault output first).
+/// Build FI/FO parent+child reveal PSBT (parent input first; vault = first valued out).
 pub fn build_parent_child_reveal_psbt(
     params: ParentChildRevealParams,
 ) -> Result<Psbt, PsbtBuildError> {
@@ -156,7 +160,7 @@ pub fn build_parent_child_reveal_psbt(
             script_pubkey: spk,
         });
     }
-    append_op_return(&mut outputs, params.op_return)?;
+    prepend_op_return(&mut outputs, params.op_return)?;
 
     let tx = Transaction {
         version: Version::TWO,
@@ -312,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_child_op_return_after_child_preserves_vault_child() {
+    fn parent_child_op_return_is_vout0_vault_vout1_child_vout2() {
         let (commit_spk, spend, leaf) = mock_commit();
         let dest = commit_spk.clone();
         let psbt = parent_child_base(
@@ -324,14 +328,14 @@ mod tests {
             Some(b"phechan".to_vec()),
         );
         assert_eq!(psbt.unsigned_tx.output.len(), 3);
-        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 546);
-        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 546);
-        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 0);
-        assert!(psbt.unsigned_tx.output[2].script_pubkey.is_op_return());
+        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 0);
+        assert!(psbt.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 546); // vault
+        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 546); // child
     }
 
     #[test]
-    fn parent_child_op_return_after_change() {
+    fn parent_child_op_return_then_change_is_vout3() {
         let (commit_spk, spend, leaf) = mock_commit();
         let dest = commit_spk.clone();
         let psbt = parent_child_base(
@@ -343,9 +347,10 @@ mod tests {
             Some(b"phechan".to_vec()),
         );
         assert_eq!(psbt.unsigned_tx.output.len(), 4);
-        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 8_000);
-        assert_eq!(psbt.unsigned_tx.output[3].value.to_sat(), 0);
-        assert!(psbt.unsigned_tx.output[3].script_pubkey.is_op_return());
+        assert!(psbt.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 546);
+        assert_eq!(psbt.unsigned_tx.output[2].value.to_sat(), 546);
+        assert_eq!(psbt.unsigned_tx.output[3].value.to_sat(), 8_000);
     }
 
     #[test]
@@ -406,7 +411,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(with.unsigned_tx.output.len(), 2);
-        assert_eq!(with.unsigned_tx.output[0].value.to_sat(), 546);
-        assert!(with.unsigned_tx.output[1].script_pubkey.is_op_return());
+        assert!(with.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert_eq!(with.unsigned_tx.output[0].value.to_sat(), 0);
+        assert_eq!(with.unsigned_tx.output[1].value.to_sat(), 546);
     }
 }

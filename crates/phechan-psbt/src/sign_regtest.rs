@@ -385,8 +385,9 @@ mod tests {
         let tx = finalize_to_tx(&signed).unwrap();
         assert!(!tx.input[0].witness.is_empty());
         assert_eq!(tx.output.len(), 2);
-        assert!(tx.output[1].script_pubkey.is_op_return());
-        assert_eq!(tx.output[1].value.to_sat(), 0);
+        assert!(tx.output[0].script_pubkey.is_op_return());
+        assert_eq!(tx.output[0].value.to_sat(), 0);
+        assert_eq!(tx.output[1].value.to_sat(), 9_500);
     }
 
     #[test]

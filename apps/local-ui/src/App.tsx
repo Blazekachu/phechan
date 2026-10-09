@@ -933,7 +933,7 @@ export default function App() {
           sameSat
             ? `parent+child on same sat → ${activePlan.destination || address}`
             : activePlan.parentOutpoint
-              ? `parent returned → vout0 ${activePlan.destination || address} (${activePlan.parentValue} sats)`
+              ? `parent returned → vout${activePlan.opReturn ? 1 : 0} ${activePlan.destination || address} (${activePlan.parentValue} sats)`
               : "",
           explorerTxUrl(activePlan.network || network, revealTxid),
         ]
@@ -2418,6 +2418,10 @@ export default function App() {
           <summary>Transaction options — fee rate, postage, UTXO, vanity</summary>
           <label htmlFor="opr">OP_RETURN (optional)</label>
           <input id="opr" value={opReturn} onChange={(e) => setOpReturn(e.target.value)} />
+          <p className="field-help">
+            When set: reveal vout0 = message (0 sats), then parent/vault, child, change.
+            When empty: vault stays vout0 (unchanged).
+          </p>
 
           <label htmlFor="utxo">Funding UTXO (payment only)</label>
           <p className="field-help">

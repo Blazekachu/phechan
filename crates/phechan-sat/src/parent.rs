@@ -4,7 +4,8 @@ use crate::flow::{simulate_sat_flow, SatFlowError, SatLocation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParentPlacementPolicy {
-    /// Default: parent first input, return first output.
+    /// Default: parent first input; return to first *valued* output
+    /// (vout0 normally, or vout1 when a leading 0-sat OP_RETURN is present).
     FirstInFirstOut,
     /// Opt-in: any layout; must pass sat-flow against `vault_vout`.
     Custom,
@@ -35,7 +36,10 @@ impl std::fmt::Display for ParentPlacementError {
                 write!(f, "FirstInFirstOut requires parent_input_index == 0")
             }
             Self::FifoRequiresVaultFirstOutput => {
-                write!(f, "FirstInFirstOut requires vault_vout == 0")
+                write!(
+                    f,
+                    "FirstInFirstOut requires vault at the first valued output"
+                )
             }
         }
     }
@@ -57,7 +61,11 @@ pub fn verify_parent_return(
             if parent_input_index != 0 {
                 return Err(ParentPlacementError::FifoRequiresParentFirstInput);
             }
-            if vault_vout != 0 {
+            let first_valued = output_values
+                .iter()
+                .position(|&v| v > 0)
+                .ok_or(ParentPlacementError::FifoRequiresVaultFirstOutput)?;
+            if vault_vout != first_valued {
                 return Err(ParentPlacementError::FifoRequiresVaultFirstOutput);
             }
         }
@@ -103,8 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_trailing_zero_op_return_value_does_not_steal_parent() {
-        // OP_RETURN is 0 sats after vault+child — must not move parent off vout0.
+    fn fifo_trailing_zero_still_vault_vout0() {
         assert!(verify_parent_return(
             ParentPlacementPolicy::FirstInFirstOut,
             0,
@@ -114,6 +121,36 @@ mod tests {
             &[1000, 4800, 0],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn fifo_leading_zero_op_return_vault_is_vout1() {
+        assert!(verify_parent_return(
+            ParentPlacementPolicy::FirstInFirstOut,
+            0,
+            0,
+            1,
+            &[546, 10_000],
+            &[0, 546, 546],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn fifo_leading_zero_rejects_vault_vout0() {
+        let err = verify_parent_return(
+            ParentPlacementPolicy::FirstInFirstOut,
+            0,
+            0,
+            0,
+            &[546, 10_000],
+            &[0, 546, 546],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ParentPlacementError::FifoRequiresVaultFirstOutput
+        ));
     }
 
     #[test]

@@ -394,6 +394,15 @@ fn estimate_reveal_fee_sats(
     Ok((fee, vsize))
 }
 
+/// Reveal valued-output indices when optional leading OP_RETURN is present.
+fn reveal_layout_with_op_return(has_op_return: bool) -> (usize, usize, usize) {
+    if has_op_return {
+        (1, 2, 3) // vault, child, change
+    } else {
+        (0, 1, 2)
+    }
+}
+
 /// Parse optional `--op-return` UTF-8 message (≤80 bytes) for reveal nulldata output.
 fn parse_op_return(args: &[String]) -> Result<Option<Vec<u8>>, String> {
     let Some(s) = flag_value(args, "--op-return") else {
@@ -1113,7 +1122,7 @@ fn run_single_reveal(
     if let Some(opr) = parse_op_return(args)? {
         let preview = String::from_utf8_lossy(&opr);
         println!(
-            "op_return: {preview} ({} bytes → last reveal output)",
+            "op_return: {preview} ({} bytes → reveal vout0)",
             opr.len()
         );
     }
@@ -1557,13 +1566,13 @@ fn run_single_reveal(
 
 /// FI/FO parent+child reveal for wallet UI (signet/testnet/regtest/mainnet).
 ///
-/// Layout (always):
+/// Layout:
 /// - vin0 = parent inscription UTXO (wallet signs)
 /// - vin1 = commit (keystore script-path if automation key; else wallet signs too)
-/// - vout0 = vault — parent sat returns here (same value as parent input)
-/// - vout1 = child destination — new inscription postage
-/// - vout2 = optional change to payment address when commit surplus > fee at `--fee-rate`
-/// - final = optional OP_RETURN (`--op-return`) after child [+ change]
+/// - optional `--op-return` → vout0 (0 sats); valued outs shift +1
+/// - vault = first valued out — parent sat returns here
+/// - next = child destination — new inscription postage
+/// - optional change to payment address when commit surplus > fee at `--fee-rate`
 ///
 /// Returns a PSBT; wallet must sign remaining inputs, then finalize / broadcast.
 fn reveal_parent_child_wallet(
@@ -1658,6 +1667,12 @@ fn reveal_parent_child_wallet(
     let change_addr = parse_reveal_change_address(args, network)?;
     let fee_rate = parse_fee_rate(args)?.unwrap_or(DEFAULT_FEE_RATE_SATS_VB);
     let op_return = parse_op_return(args)?;
+    let has_opr = op_return.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
+    let (vault_i, child_i, change_i) = reveal_layout_with_op_return(has_opr);
+    let opr_preview = op_return
+        .as_ref()
+        .filter(|d| !d.is_empty())
+        .map(|d| (String::from_utf8_lossy(d).into_owned(), d.len()));
     // Measure base parent-child vsize (no change), then optionally peel surplus to payment addr.
     let (_fee_est, vsize_no_change) = estimate_reveal_fee_sats(
         commit,
@@ -1682,7 +1697,11 @@ fn reveal_parent_child_wallet(
         ));
     }
 
-    let mut out_vals = vec![parent_value_sats, postage_sats];
+    let mut out_vals = if has_opr {
+        vec![0, parent_value_sats, postage_sats]
+    } else {
+        vec![parent_value_sats, postage_sats]
+    };
     if change_sats > 0 {
         out_vals.push(change_sats);
     }
@@ -1690,7 +1709,7 @@ fn reveal_parent_child_wallet(
         policy: ParentPlacementPolicy::FirstInFirstOut,
         parent_input_index: 0,
         parent_sat_offset: 0,
-        vault_vout: 0,
+        vault_vout: vault_i,
         input_values: &[parent_value_sats, commit_value_sats],
         output_values: &out_vals,
         labeled_inputs: &[LabeledUtxo {
@@ -1785,12 +1804,15 @@ fn reveal_parent_child_wallet(
     println!("parent_outpoint: {parent_out}");
     println!("parent_value_sats: {parent_value_sats}");
     println!("vault_address: {vault_addr_s}");
-    println!("vault_vout: 0");
+    if let Some((preview, len)) = &opr_preview {
+        println!("op_return: {preview} ({len} bytes → reveal vout0)");
+    }
+    println!("vault_vout: {vault_i}");
     println!(
-        "parent_lands: vout0 {vault_addr_s} ({parent_value_sats} sats) — same sat(s) as parent, returned after spend"
+        "parent_lands: vout{vault_i} {vault_addr_s} ({parent_value_sats} sats) — same sat(s) as parent, returned after spend"
     );
     println!(
-        "child_lands: vout1 {dest_addr_str} ({postage_sats} sats postage) — new child inscription"
+        "child_lands: vout{child_i} {dest_addr_str} ({postage_sats} sats postage) — new child inscription"
     );
     println!("reveal_fee_sats: {fee_sats}");
     if change_sats > 0 {
@@ -1799,7 +1821,7 @@ fn reveal_parent_child_wallet(
             .map(|a| a.to_string())
             .unwrap_or_default();
         println!(
-            "reveal_change_sats: {change_sats} → vout2 {chg_addr} (surplus after {fee_rate} sat/vB)"
+            "reveal_change_sats: {change_sats} → vout{change_i} {chg_addr} (surplus after {fee_rate} sat/vB)"
         );
         println!("disclosure: over-funded commit surplus returned as change; inscribed sat stays on child postage");
     } else {
@@ -2026,13 +2048,21 @@ fn child(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let child_value = Amount::from_sat(commit_value_sats.saturating_sub(fee_sats));
+    let op_return = parse_op_return(args)?;
+    let has_opr = op_return.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
+    let (vault_i, _child_i, _change_i) = reveal_layout_with_op_return(has_opr);
+    let out_vals = if has_opr {
+        vec![0, parent_value_sats, child_value.to_sat()]
+    } else {
+        vec![parent_value_sats, child_value.to_sat()]
+    };
     let live_layout = validate_parent_child_layout(ParentChildValidationInput {
         policy: ParentPlacementPolicy::FirstInFirstOut,
         parent_input_index: 0,
         parent_sat_offset: 0,
-        vault_vout: 0,
+        vault_vout: vault_i,
         input_values: &[parent_value_sats, commit_value_sats],
-        output_values: &[parent_value_sats, child_value.to_sat()],
+        output_values: &out_vals,
         labeled_inputs: &[LabeledUtxo {
             txid_hex: parent_txid_s.clone(),
             vout: parent_vout,
@@ -2069,7 +2099,7 @@ fn child(args: &[String]) -> Result<(), String> {
         spend_info: commit.spend_info.clone(),
         change_script_pubkey: None,
         change_value: Amount::ZERO,
-        op_return: parse_op_return(args)?,
+        op_return,
     })
     .map_err(|e| e.to_string())?;
 
